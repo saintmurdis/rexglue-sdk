@@ -1632,6 +1632,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.
   uint32_t base_slice_first = 0;
   uint32_t base_slice_count = array_size;
+  // Tiled 3D: depth range in whole groups of 8 slices, and the byte stride of
+  // such a group (unscaled).
+  constexpr uint32_t kZGroupDepth = 8;
+  uint32_t base_z_first = 0;
+  uint32_t base_z_count = depth;
+  uint32_t base_z_group_stride = 0;
   if (load_base && d3d12_texture.partial_reload_tracked() &&
       REXCVAR_GET(texture_partial_array_reload)) {
     uint32_t dirty_first, dirty_last;
@@ -1642,7 +1648,22 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     }
     uint32_t slice_stride = d3d12_texture.guest_layout().base.array_slice_stride_bytes;
     uint32_t base_address = uint32_t(texture_key.base_page) << 12;
-    if (partial && slice_stride && dirty_first >= base_address) {
+    if (is_3d) {
+      const auto& base_layout = d3d12_texture.guest_layout().base;
+      base_z_group_stride = uint32_t(texture_util::GetTiledOffset3D(
+          0, 0, int32_t(kZGroupDepth), base_layout.row_pitch_bytes / bytes_per_block,
+          base_layout.z_slice_stride_block_rows, rex::log2_floor(bytes_per_block)));
+      if (partial && base_z_group_stride && dirty_first >= base_address) {
+        uint32_t group_first = (dirty_first - base_address) / base_z_group_stride;
+        uint32_t group_last = (dirty_last - base_address) / base_z_group_stride;
+        uint32_t z_first = group_first * kZGroupDepth;
+        uint32_t z_end = std::min((group_last + 1) * kZGroupDepth, depth);
+        if (z_first < z_end) {
+          base_z_first = z_first;
+          base_z_count = z_end - z_first;
+        }
+      }
+    } else if (partial && slice_stride && dirty_first >= base_address) {
       uint32_t first = (dirty_first - base_address) / slice_stride;
       uint32_t last = std::min((dirty_last - base_address) / slice_stride, array_size - 1);
       if (first <= last) {
@@ -1661,13 +1682,18 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                     LoadStat>
         load_stats;
     static uint64_t load_window_start = rex::chrono::Clock::QueryHostTickCount();
-    uint64_t texels = uint64_t(width) * height * depth_or_array_size * texture_resolution_scale_x *
-                      texture_resolution_scale_y;
+    // Texels actually processed (partial reloads only cover part of the base).
+    uint64_t texels = uint64_t(width) * height * (is_3d ? base_z_count : base_slice_count) *
+                      texture_resolution_scale_x * texture_resolution_scale_y;
     auto& stat = load_stats[{uint32_t(texture_key.base_page) << 12, width, height,
                              depth_or_array_size, uint32_t(guest_format),
-                             uint32_t(texture_resolution_scaled),
+                             uint32_t(texture_resolution_scaled) |
+                                 (uint32_t(texture_key.dimension) << 4) |
+                                 (uint32_t(d3d12_texture.partial_reload_tracked()) << 8) |
+                                 (uint32_t(texture_key.tiled) << 12),
                              uint32_t(load_base) | (uint32_t(load_mips) << 1) |
-                                 (uint32_t(texture_key.mip_max_level) << 2)}];
+                                 (uint32_t(texture_key.mip_max_level) << 2) |
+                                 (d3d12_texture.guest_layout().base.array_slice_stride_bytes << 8)}];
     ++stat.count;
     stat.host_texels += texels;
     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
@@ -1680,8 +1706,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
         total_texels += v.host_texels;
         rows.emplace_back(
             v.host_texels,
-            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled {} base/mips/mipmax {:X} -> {} loads, "
-                        "{:.1f} Mtexels",
+            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled/dim/tracked/tiled {:X} "
+                        "base/mips/mipmax/slicestride {:X} -> {} loads, {:.1f} Mtexels",
                         std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
                         std::get<4>(k), std::get<5>(k), std::get<6>(k), v.count,
                         v.host_texels / 1.0e6));
@@ -1947,6 +1973,16 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     load_constants.host_offset = uint32_t(level_host_slice_layout.Offset);
     load_constants.host_pitch = level_host_slice_layout.Footprint.RowPitch;
 
+    if (is_base && is_3d && base_z_count != depth) {
+      // The tiled 3D address is linear in whole groups of 8 slices, so the
+      // shader can start at a group boundary with only the offsets shifted.
+      load_constants.guest_offset += base_z_group_stride * (base_z_first / kZGroupDepth) *
+                                     (texture_resolution_scale_x * texture_resolution_scale_y);
+      load_constants.host_offset +=
+          level_host_slice_layout.Footprint.RowPitch *
+          (level_host_slice_layout.Footprint.Height / host_block_height) * base_z_first;
+      load_constants.size_blocks[2] = base_z_count;
+    }
     command_list.D3DSetComputeRoot32BitConstants(0, sizeof(load_constants) / sizeof(uint32_t),
                                                  &load_constants, 0);
 
@@ -2043,12 +2079,26 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     } else {
       source_box_ptr = nullptr;
     }
+    uint32_t copy_dest_z = 0;
+    if (level == 0 && is_3d && base_z_count != depth) {
+      const D3D12_SUBRESOURCE_FOOTPRINT& footprint = location_source.PlacedFootprint.Footprint;
+      D3D12_RESOURCE_DESC texture_desc = texture_resource->GetDesc();
+      source_box.left = 0;
+      source_box.top = 0;
+      source_box.right = std::min(footprint.Width, UINT(texture_desc.Width));
+      source_box.bottom = std::min(footprint.Height, UINT(texture_desc.Height));
+      source_box.front = base_z_first;
+      source_box.back = base_z_first + base_z_count;
+      source_box_ptr = &source_box;
+      copy_dest_z = base_z_first;
+    }
     uint32_t copy_slice_first = level == 0 ? base_slice_first : 0;
     uint32_t copy_slice_end = level == 0 ? base_slice_first + base_slice_count : array_size;
     location_dest.SubresourceIndex += texture_level_count * copy_slice_first;
     location_source.PlacedFootprint.Offset += host_slice_size * copy_slice_first;
     for (uint32_t slice = copy_slice_first; slice < copy_slice_end; ++slice) {
-      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
+      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, copy_dest_z, &location_source,
+                                        source_box_ptr);
       location_dest.SubresourceIndex += texture_level_count;
       location_source.PlacedFootprint.Offset += host_slice_size;
     }

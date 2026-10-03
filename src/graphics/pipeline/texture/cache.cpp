@@ -661,9 +661,15 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
   // Never try to upload data that doesn't exist.
   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
 
-  if (key.dimension == xenos::DataDimension::k2DOrStacked && key.mip_max_level == 0 &&
-      key.GetDepthOrArraySize() > 1 && guest_layout().base.array_slice_stride_bytes != 0 &&
-      base_outdated_) {
+  // 2D arrays reload by slice; tiled 3D textures by groups of 8 depth slices,
+  // which is the period of the 3D tiling (the in-tile layout alternates between
+  // odd and even groups of 4 slices).
+  bool partial_eligible =
+      (key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() > 1 &&
+       guest_layout().base.array_slice_stride_bytes != 0) ||
+      (key.dimension == xenos::DataDimension::k3D && key.tiled &&
+       key.GetDepthOrArraySize() >= 16);
+  if (partial_eligible && key.mip_max_level == 0 && base_outdated_) {
     partial_reload_tracked_ = true;
     auto lock = rex::thread::global_critical_region::AcquireDirect();
     texture_cache.partial_reload_textures_.push_back(this);
