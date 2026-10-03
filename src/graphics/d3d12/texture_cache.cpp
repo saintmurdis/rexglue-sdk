@@ -14,10 +14,14 @@
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
@@ -31,6 +35,10 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
+                    "Every 2 seconds, log which guest textures were (re)loaded and how many "
+                    "host texels that took.");
 
 namespace rex::graphics::d3d12 {
 
@@ -1607,6 +1615,51 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+
+  if (REXCVAR_GET(d3d12_log_texture_loads)) {
+    struct LoadStat {
+      uint64_t count = 0;
+      uint64_t host_texels = 0;
+    };
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>,
+                    LoadStat>
+        load_stats;
+    static uint64_t load_window_start = rex::chrono::Clock::QueryHostTickCount();
+    uint64_t texels = uint64_t(width) * height * depth_or_array_size * texture_resolution_scale_x *
+                      texture_resolution_scale_y;
+    auto& stat = load_stats[{uint32_t(texture_key.base_page) << 12, width, height,
+                             depth_or_array_size, uint32_t(guest_format),
+                             uint32_t(texture_resolution_scaled),
+                             uint32_t(load_base) | (uint32_t(load_mips) << 1) |
+                                 (uint32_t(texture_key.mip_max_level) << 2)}];
+    ++stat.count;
+    stat.host_texels += texels;
+    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    if (double(now - load_window_start) / double(rex::chrono::Clock::QueryHostTickFrequency()) >=
+        2.0) {
+      std::vector<std::pair<uint64_t, std::string>> rows;
+      uint64_t total_count = 0, total_texels = 0;
+      for (const auto& [k, v] : load_stats) {
+        total_count += v.count;
+        total_texels += v.host_texels;
+        rows.emplace_back(
+            v.host_texels,
+            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled {} base/mips/mipmax {:X} -> {} loads, "
+                        "{:.1f} Mtexels",
+                        std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
+                        std::get<4>(k), std::get<5>(k), std::get<6>(k), v.count,
+                        v.host_texels / 1.0e6));
+      }
+      std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
+      REXGPU_INFO("Texture loads in 2s: {} loads, {:.1f} Mtexels, {} distinct", total_count,
+                  total_texels / 1.0e6, rows.size());
+      for (size_t i = 0; i < std::min<size_t>(rows.size(), 12); ++i) {
+        REXGPU_INFO("  {}", rows[i].second);
+      }
+      load_stats.clear();
+      load_window_start = now;
+    }
+  }
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
