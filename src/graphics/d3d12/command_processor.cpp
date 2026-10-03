@@ -836,7 +836,7 @@ void D3D12CommandProcessor::GpuProfileMark() {
   deferred_command_list_.D3DEndQuery(gpu_profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                                      gpu_profile_next_query_++);
   gpu_profile_open_.segment_categories.push_back(
-      gpu_profile_stack_.empty() ? GpuProfileCategory::kDraw : gpu_profile_stack_.back());
+      gpu_profile_stack_.empty() ? gpu_profile_draw_category_ : gpu_profile_stack_.back());
 }
 
 void D3D12CommandProcessor::GpuProfileEndSubmission() {
@@ -884,8 +884,9 @@ void D3D12CommandProcessor::GpuProfileCollect() {
   double window_s = double(now - gpu_profile_window_start_) / double(freq);
   if (window_s < 2.0)
     return;
-  static const char* const kNames[] = {"draw",         "transfer",     "resolve", "texload",
-                                       "texload_array", "texload_large", "swap"};
+  static const char* const kNames[] = {"draw",          "transfer",      "resolve",
+                                       "texload",       "texload_array", "texload_large",
+                                       "swap",          "draw_msaa2x",   "draw_msaa4x"};
   double total = 0;
   std::string text;
   for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
@@ -2533,6 +2534,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  if (gpu_profile_query_heap_) {
+    xenos::MsaaSamples draw_msaa = regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
+    GpuProfileCategory draw_category = draw_msaa == xenos::MsaaSamples::k4X
+                                           ? GpuProfileCategory::kDrawMsaa4x
+                                       : draw_msaa == xenos::MsaaSamples::k2X
+                                           ? GpuProfileCategory::kDrawMsaa2x
+                                           : GpuProfileCategory::kDraw;
+    if (draw_category != gpu_profile_draw_category_) {
+      gpu_profile_draw_category_ = draw_category;
+      GpuProfileMark();
+    }
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;

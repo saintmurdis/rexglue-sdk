@@ -196,6 +196,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     kTextureLoadArray,  // tracked 2D arrays (partial slice reloads)
     kTextureLoadLarge,  // at least 1M host texels per load
     kSwap,
+    kDrawMsaa2x,  // guest draws into 2x MSAA render targets
+    kDrawMsaa4x,  // guest draws into 4x MSAA render targets
     kCount,
   };
   void GpuProfilePush(GpuProfileCategory category);
@@ -456,6 +458,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t gpu_profile_frequency_ = 0;
   uint32_t gpu_profile_next_query_ = 0;
   std::vector<GpuProfileCategory> gpu_profile_stack_;
+  // Category of guest drawing outside pushed scopes (by MSAA sample count).
+  GpuProfileCategory gpu_profile_draw_category_ = GpuProfileCategory::kDraw;
   struct GpuProfileSubmission {
     uint64_t submission;
     uint32_t first_query;
