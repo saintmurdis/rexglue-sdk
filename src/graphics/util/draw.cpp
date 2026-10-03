@@ -951,8 +951,19 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
       xenos::kTextureTileWidthHeightLog2;
   info_out.copy_dest_coordinate_info.pitch_aligned_div_32 = copy_dest_pitch_aligned_div_32;
+  // For volume resolves, D3D writes pitch * level height in blocks to
+  // RB_COPY_SURFACE_SLICE - that's the height the 3D tiling uses. Only fall
+  // back to copy_dest_height, which instead includes the top of the source
+  // rectangle (as in xenia-canary).
+  uint32_t copy_dest_height = rb_copy_dest_pitch.copy_dest_height;
+  if (rb_copy_dest_info.copy_dest_array) {
+    uint32_t rb_copy_surface_slice = regs[XE_GPU_REG_RB_COPY_SURFACE_SLICE];
+    if (rb_copy_surface_slice && rb_copy_dest_pitch.copy_dest_pitch) {
+      copy_dest_height = rb_copy_surface_slice / rb_copy_dest_pitch.copy_dest_pitch;
+    }
+  }
   info_out.copy_dest_coordinate_info.height_aligned_div_32 =
-      (rb_copy_dest_pitch.copy_dest_height + (xenos::kTextureTileWidthHeight - 1)) >>
+      (copy_dest_height + (xenos::kTextureTileWidthHeight - 1)) >>
       xenos::kTextureTileWidthHeightLog2;
   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
   if (is_depth || dest_format_info.type == FormatType::kResolvable) {
@@ -974,17 +985,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       // 3-bit).
       copy_dest_base_adjusted += texture_util::GetTiledOffset3D(
           int32_t(dest_base_x), int32_t(dest_base_y), 0, rb_copy_dest_pitch.copy_dest_pitch,
-          rb_copy_dest_pitch.copy_dest_height, bpp_log2);
+          copy_dest_height, bpp_log2);
       copy_dest_extent_start =
           rb_copy_dest_base + texture_util::GetTiledAddressLowerBound3D(
                                   uint32_t(x0), uint32_t(y0), rb_copy_dest_info.copy_dest_slice,
                                   rb_copy_dest_pitch.copy_dest_pitch,
-                                  rb_copy_dest_pitch.copy_dest_height, bpp_log2);
+                                  copy_dest_height, bpp_log2);
       copy_dest_extent_end =
           rb_copy_dest_base + texture_util::GetTiledAddressUpperBound3D(
                                   uint32_t(x1), uint32_t(y1), rb_copy_dest_info.copy_dest_slice + 1,
                                   rb_copy_dest_pitch.copy_dest_pitch,
-                                  rb_copy_dest_pitch.copy_dest_height, bpp_log2);
+                                  copy_dest_height, bpp_log2);
     } else {
       copy_dest_base_adjusted += texture_util::GetTiledOffset2D(
           int32_t(dest_base_x), int32_t(dest_base_y), rb_copy_dest_pitch.copy_dest_pitch, bpp_log2);
