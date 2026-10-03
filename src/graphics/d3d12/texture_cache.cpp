@@ -1570,11 +1570,6 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
-  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kTextureLoad);
-  struct GpuProfilePop {
-    D3D12CommandProcessor& cp;
-    ~GpuProfilePop() { cp.GpuProfilePop(); }
-  } gpu_profile_pop{command_processor_};
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
 
@@ -1618,6 +1613,20 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+
+  {
+    uint64_t host_texels = uint64_t(width) * height * depth_or_array_size *
+                           texture_resolution_scale_x * texture_resolution_scale_y;
+    command_processor_.GpuProfilePush(
+        d3d12_texture.partial_reload_tracked()
+            ? D3D12CommandProcessor::GpuProfileCategory::kTextureLoadArray
+        : host_texels >= (1u << 20) ? D3D12CommandProcessor::GpuProfileCategory::kTextureLoadLarge
+                                    : D3D12CommandProcessor::GpuProfileCategory::kTextureLoad);
+  }
+  struct GpuProfilePop {
+    D3D12CommandProcessor& cp;
+    ~GpuProfilePop() { cp.GpuProfilePop(); }
+  } gpu_profile_pop{command_processor_};
 
   // Base slices to (re)load - only the ones the GPU wrote since the last load
   // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.

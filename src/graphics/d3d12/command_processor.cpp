@@ -884,7 +884,8 @@ void D3D12CommandProcessor::GpuProfileCollect() {
   double window_s = double(now - gpu_profile_window_start_) / double(freq);
   if (window_s < 2.0)
     return;
-  static const char* const kNames[] = {"draw", "transfer", "resolve", "texload", "swap"};
+  static const char* const kNames[] = {"draw",         "transfer",     "resolve", "texload",
+                                       "texload_array", "texload_large", "swap"};
   double total = 0;
   std::string text;
   for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {

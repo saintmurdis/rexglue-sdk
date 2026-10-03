@@ -192,7 +192,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     kDraw,
     kTransfer,
     kResolve,
-    kTextureLoad,
+    kTextureLoad,       // other textures
+    kTextureLoadArray,  // tracked 2D arrays (partial slice reloads)
+    kTextureLoadLarge,  // at least 1M host texels per load
     kSwap,
     kCount,
   };
