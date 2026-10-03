@@ -186,6 +186,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Sets the current cached values to external ones. This is for cache
   // invalidation primarily. A submission must be open.
   void SetExternalPipeline(ID3D12PipelineState* pipeline);
+  // Bisects deferred_command_list_ after its Close() failed and logs the
+  // offending command (see the d3d12_diagnose_invalid_command_lists cvar).
+  void DiagnoseInvalidCommandList();
   void SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature);
   void SetViewport(const D3D12_VIEWPORT& viewport);
   void SetScissorRect(const D3D12_RECT& scissor_rect);

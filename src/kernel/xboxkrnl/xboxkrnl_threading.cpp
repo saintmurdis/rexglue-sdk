@@ -13,6 +13,11 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <rex/cvar.h>
+#include <tuple>
+#include <string>
+#include <mutex>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -38,6 +43,85 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+
+
+REXCVAR_DEFINE_BOOL(log_wait_stats, false, "Kernel",
+                    "Every 2 seconds, log which guest call sites (by link register) spent "
+                    "time in kernel waits/delays, per thread. For finding frame limiters.");
+
+namespace rex::kernel::xboxkrnl {
+namespace {
+
+struct WaitStatKey {
+  uint32_t thread_id;
+  uint32_t kind;
+  uint32_t lr;
+  bool operator<(const WaitStatKey& o) const {
+    return std::tie(thread_id, kind, lr) < std::tie(o.thread_id, o.kind, o.lr);
+  }
+};
+struct WaitStatValue {
+  uint64_t count = 0;
+  double total_ms = 0;
+  int64_t last_timeout = 0;
+};
+
+std::mutex g_wait_stats_mutex;
+std::map<WaitStatKey, WaitStatValue> g_wait_stats;
+std::chrono::steady_clock::time_point g_wait_stats_window = std::chrono::steady_clock::now();
+
+const char* const kWaitKindNames[] = {"KeDelayExecutionThread", "KeWaitForSingleObject",
+                                      "NtWaitForSingleObjectEx", "KeWaitForMultipleObjects",
+                                      "NtWaitForMultipleObjectsEx", "NtYieldExecution"};
+
+// Measures one kernel wait and attributes it to the guest caller.
+class WaitStatScope {
+ public:
+  WaitStatScope(uint32_t kind, int64_t timeout) : enabled_(REXCVAR_GET(log_wait_stats)) {
+    if (!enabled_)
+      return;
+    kind_ = kind;
+    timeout_ = timeout;
+    PPCContext* ctx = runtime::current_ppc_context();
+    lr_ = ctx ? uint32_t(ctx->lr) : 0;
+    start_ = std::chrono::steady_clock::now();
+  }
+  ~WaitStatScope() {
+    if (!enabled_)
+      return;
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - start_).count();
+    std::lock_guard<std::mutex> lock(g_wait_stats_mutex);
+    auto& v = g_wait_stats[{runtime::ThreadState::GetThreadID(), kind_, lr_}];
+    ++v.count;
+    v.total_ms += ms;
+    v.last_timeout = timeout_;
+    double window_s = std::chrono::duration<double>(now - g_wait_stats_window).count();
+    if (window_s < 2.0)
+      return;
+    REXKRNL_INFO("Wait stats over {:.1f}s:", window_s);
+    for (const auto& [k, val] : g_wait_stats) {
+      if (val.total_ms < 50.0 && val.count < 60)
+        continue;
+      REXKRNL_INFO("  thread {:4} {:26} lr={:08X} count={:6} total={:8.1f}ms timeout={}",
+                   k.thread_id, kWaitKindNames[k.kind], k.lr, val.count, val.total_ms,
+                   val.last_timeout == INT64_MIN ? std::string("none")
+                                                 : std::to_string(val.last_timeout));
+    }
+    g_wait_stats.clear();
+    g_wait_stats_window = now;
+  }
+
+ private:
+  bool enabled_;
+  uint32_t kind_ = 0;
+  uint32_t lr_ = 0;
+  int64_t timeout_ = 0;
+  std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace
+}  // namespace rex::kernel::xboxkrnl
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -374,6 +458,7 @@ u32 KeQueryPerformanceFrequency_entry() {
 }
 
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
+  WaitStatScope wait_stat_scope(0, int64_t(uint64_t(*interval_ptr)));
   XThread* thread = XThread::GetCurrentThread();
 
   if (alertable) {
@@ -390,6 +475,7 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 }
 
 u32 NtYieldExecution_entry() {
+  WaitStatScope wait_stat_scope(5, INT64_MIN);
   rex::thread::MaybeYield();
   return X_STATUS_SUCCESS;
 }
@@ -838,6 +924,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  WaitStatScope wait_stat_scope(1, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -852,6 +939,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  WaitStatScope wait_stat_scope(2, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -871,6 +959,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
+  WaitStatScope wait_stat_scope(3, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
   assert_true(wait_type <= 1);
 
   std::vector<object_ref<XObject>> objects;
@@ -919,6 +1008,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  WaitStatScope wait_stat_scope(4, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);

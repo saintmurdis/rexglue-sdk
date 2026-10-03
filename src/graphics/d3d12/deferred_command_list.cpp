@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <iterator>
+
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
@@ -30,6 +33,108 @@ void DeferredCommandList::Reset() {
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                   ID3D12GraphicsCommandList1* command_list_1) {
+  ExecuteRange(command_list, command_list_1, 0, SIZE_MAX);
+}
+
+std::string DeferredCommandList::DescribeCommand(size_t index) const {
+  static const char* const kNames[] = {
+      "ClearDepthStencilView",
+      "ClearRenderTargetView",
+      "ClearUnorderedAccessViewUint",
+      "CopyBufferRegion",
+      "CopyResource",
+      "CopyTexture",
+      "CopyTextureRegion",
+      "Dispatch",
+      "DrawIndexedInstanced",
+      "DrawInstanced",
+      "BeginQuery",
+      "EndQuery",
+      "ResolveQueryData",
+      "IASetIndexBuffer",
+      "IASetPrimitiveTopology",
+      "IASetVertexBuffers",
+      "OMSetBlendFactor",
+      "OMSetRenderTargets",
+      "OMSetStencilRef",
+      "ResourceBarrier",
+      "RSSetScissorRect",
+      "RSSetViewport",
+      "SetComputeRoot32BitConstants",
+      "SetGraphicsRoot32BitConstants",
+      "SetComputeRootConstantBufferView",
+      "SetGraphicsRootConstantBufferView",
+      "SetComputeRootDescriptorTable",
+      "SetGraphicsRootDescriptorTable",
+      "SetComputeRootShaderResourceView",
+      "SetGraphicsRootShaderResourceView",
+      "SetComputeRootSignature",
+      "SetGraphicsRootSignature",
+      "SetComputeRootUnorderedAccessView",
+      "SetGraphicsRootUnorderedAccessView",
+      "SetDescriptorHeaps",
+      "SetPipelineState",
+      "SetPipelineStateHandle",
+      "SetSamplePositions",
+      "BeginDebugMarker",
+      "EndDebugMarker",
+      "InsertDebugMarker",
+  };
+  const uintmax_t* stream = command_stream_.data();
+  size_t stream_remaining = command_stream_.size();
+  for (size_t i = 0; stream_remaining != 0; ++i) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    stream += kCommandHeaderSizeElements;
+    stream_remaining -= kCommandHeaderSizeElements;
+    if (i == index) {
+      size_t type = size_t(header.command);
+      std::string text =
+          fmt::format("{} (type {})", type < std::size(kNames) ? kNames[type] : "?", type);
+      if (header.command == Command::kD3DCopyTextureRegion) {
+        auto& args = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(stream);
+        if (args.dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+          D3D12_RESOURCE_DESC dd = args.dst.pResource->GetDesc();
+          text += fmt::format(" dst subresource {} of {}x{}x{} mips {} fmt {} at ({}, {}, {})",
+                              args.dst.SubresourceIndex, dd.Width, dd.Height, dd.DepthOrArraySize,
+                              dd.MipLevels, int(dd.Format), args.dst_x, args.dst_y, args.dst_z);
+        }
+        if (args.src.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+          const D3D12_SUBRESOURCE_FOOTPRINT& fp = args.src.PlacedFootprint.Footprint;
+          text += fmt::format(" src footprint {}x{}x{} pitch {} fmt {} offset {}", fp.Width,
+                              fp.Height, fp.Depth, fp.RowPitch, int(fp.Format),
+                              args.src.PlacedFootprint.Offset);
+        } else {
+          D3D12_RESOURCE_DESC sd = args.src.pResource->GetDesc();
+          text += fmt::format(" src subresource {} of {}x{}x{} mips {} fmt {}",
+                              args.src.SubresourceIndex, sd.Width, sd.Height, sd.DepthOrArraySize,
+                              sd.MipLevels, int(sd.Format));
+        }
+        if (args.has_src_box) {
+          text += fmt::format(" box ({}, {}, {})-({}, {}, {})", args.src_box.left,
+                              args.src_box.top, args.src_box.front, args.src_box.right,
+                              args.src_box.bottom, args.src_box.back);
+        }
+      } else {
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(stream);
+        size_t word_count =
+            std::min<size_t>(header.arguments_size_elements * (sizeof(uintmax_t) / 4), 12);
+        text += " args";
+        for (size_t w = 0; w < word_count; ++w) {
+          text += fmt::format(" {:08X}", words[w]);
+        }
+      }
+      return text;
+    }
+    stream += header.arguments_size_elements;
+    stream_remaining -= header.arguments_size_elements;
+  }
+  return "(out of range)";
+}
+
+size_t DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
+                                         ID3D12GraphicsCommandList1* command_list_1,
+                                         size_t first_command, size_t max_commands) {
+  size_t command_index = 0;
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -40,6 +145,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+    size_t this_command = command_index++;
+    if (this_command >= max_commands ||
+        (this_command < first_command && header.command != Command::kSetDescriptorHeaps)) {
+      stream += header.arguments_size_elements;
+      stream_remaining -= header.arguments_size_elements;
+      continue;
+    }
     switch (header.command) {
       case Command::kD3DClearDepthStencilView: {
         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
@@ -275,6 +387,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+  return command_index;
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {

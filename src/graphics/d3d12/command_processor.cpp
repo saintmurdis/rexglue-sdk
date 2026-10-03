@@ -32,6 +32,10 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(d3d12_diagnose_invalid_command_lists, false, "GPU/D3D12",
+                    "When a command list fails Close() (the device is then removed with "
+                    "INVALID_CALL), bisect it and log the first invalid command. Works "
+                    "without the D3D12 debug layer.");
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -760,6 +764,45 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
   scratch_buffer_used_ = false;
   if (buffer == scratch_buffer_) {
     scratch_buffer_state_ = new_state;
+  }
+}
+
+void D3D12CommandProcessor::DiagnoseInvalidCommandList() {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  // A list whose Close() failed stays broken even after Reset(), so every probe
+  // records into a new allocator and list.
+  auto probe = [&](size_t first, size_t count) -> HRESULT {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> list_1;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
+                                         nullptr, IID_PPV_ARGS(&list)))) {
+      return E_FAIL;
+    }
+    list.As(&list_1);
+    deferred_command_list_.ExecuteRange(list.Get(), list_1.Get(), first, count);
+    return list->Close();
+  };
+  size_t total = deferred_command_list_.ExecuteRange(nullptr, nullptr, 0, 0);
+  if (SUCCEEDED(probe(0, total))) {
+    REXGPU_ERROR("Command list diagnosis: the list re-recorded fine ({} commands)", total);
+    return;
+  }
+  // Prefix lo is valid, prefix hi is invalid.
+  size_t lo = 0, hi = total;
+  while (hi - lo > 1) {
+    size_t mid = lo + (hi - lo) / 2;
+    (SUCCEEDED(probe(0, mid)) ? lo : hi) = mid;
+  }
+  size_t bad = hi - 1;
+  REXGPU_ERROR("Command list diagnosis: first invalid command #{} of {}: {}", bad, total,
+               deferred_command_list_.DescribeCommand(bad));
+  REXGPU_ERROR("Command list diagnosis: alone it is {}",
+               SUCCEEDED(probe(bad, bad + 1)) ? "valid (depends on earlier state)" : "invalid");
+  for (size_t i = bad > 8 ? bad - 8 : 0; i < bad; ++i) {
+    REXGPU_ERROR("  preceding #{}: {}", i, deferred_command_list_.DescribeCommand(i));
   }
 }
 
@@ -3426,7 +3469,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
     deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
+    if (HRESULT close_result = command_list_->Close(); FAILED(close_result)) {
+      REXGPU_ERROR("D3D12 command list Close failed: 0x{:08X}", uint32_t(close_result));
+      if (REXCVAR_GET(d3d12_diagnose_invalid_command_lists)) {
+        DiagnoseInvalidCommandList();
+      }
+    }
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
     command_allocator_writable_first_->last_usage_submission = submission_current_;

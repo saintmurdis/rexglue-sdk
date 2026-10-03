@@ -643,7 +643,8 @@ void LoadConfig(const std::filesystem::path& config_path) {
   }
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream config_path_stream(config_path, std::ios::binary);
+    auto config = toml::parse(config_path_stream, config_path.string());
     ApplyTomlTable(config, "");
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {

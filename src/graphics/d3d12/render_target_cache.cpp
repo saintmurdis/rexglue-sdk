@@ -3043,8 +3043,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
             if (source_color_format != dest_color_format) {
               // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+              // k_8_8_8_8_GAMMA. _GAMMA is stored as linear, so converting to
+              // plain k_8_8_8_8 encodes gamma, and converting to _GAMMA decodes.
+              if (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
                 for (uint32_t i = 0; i < 3; ++i) {
                   DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
                 }

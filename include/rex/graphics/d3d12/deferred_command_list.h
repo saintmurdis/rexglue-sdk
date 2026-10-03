@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +36,14 @@ class DeferredCommandList {
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  // Records only commands [first_command, max_commands) (descriptor heap
+  // bindings before first_command are still recorded). Returns the total number
+  // of commands in the stream. Used to bisect command lists that fail Close().
+  size_t ExecuteRange(ID3D12GraphicsCommandList* command_list,
+                      ID3D12GraphicsCommandList1* command_list_1, size_t first_command,
+                      size_t max_commands);
+  // Human-readable description of the command at the given index.
+  std::string DescribeCommand(size_t index) const;
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,

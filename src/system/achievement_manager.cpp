@@ -77,7 +77,8 @@ void AchievementManager::ReplaceAchievements(std::vector<AchievementInfo> achiev
 
 bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
   try {
-    auto table = toml::parse_file(path.string());
+    std::ifstream path_stream(path, std::ios::binary);
+    auto table = toml::parse(path_stream, path.string());
     const auto* entries = table["achievements"].as_array();
     if (!entries) {
       REXSYS_WARN("Achievement metadata has no [[achievements]] entries: {}", path.string());
@@ -228,7 +229,8 @@ void AchievementManager::LoadUnlockState() {
 
   bool migrated = false;
   try {
-    auto table = toml::parse_file(save_path.string());
+    std::ifstream save_path_stream(save_path, std::ios::binary);
+    auto table = toml::parse(save_path_stream, save_path.string());
     std::lock_guard lock(mutex_);
     if (const auto* unlocked = table["unlocked"].as_table()) {
       for (const auto& [key, value] : *unlocked) {

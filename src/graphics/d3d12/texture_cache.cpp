@@ -1920,6 +1920,25 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                      host_block_height);
       source_box.back = source_box.front + std::max(depth >> level, uint32_t(1));
       source_box_ptr = &source_box;
+    } else if (level && (texture_resolution_scale_x > 1 || texture_resolution_scale_y > 1)) {
+      // The staging footprint is the unscaled mip size times the scale, but the
+      // host mip is the scaled size shifted down, which is smaller for odd
+      // sizes in the small mips (146 >> 8 = 0 -> 1, * 2 = 2, but 292 >> 8 = 1).
+      // Copying the whole footprint would overrun the destination subresource.
+      const D3D12_SUBRESOURCE_FOOTPRINT& footprint = location_source.PlacedFootprint.Footprint;
+      source_box.left = 0;
+      source_box.top = 0;
+      source_box.front = 0;
+      source_box.right = std::min(
+          footprint.Width,
+          UINT(rex::align(std::max((width * texture_resolution_scale_x) >> level, uint32_t(1)),
+                          host_block_width)));
+      source_box.bottom = std::min(
+          footprint.Height,
+          UINT(rex::align(std::max((height * texture_resolution_scale_y) >> level, uint32_t(1)),
+                          host_block_height)));
+      source_box.back = footprint.Depth;
+      source_box_ptr = &source_box;
     } else {
       source_box_ptr = nullptr;
     }
@@ -1995,6 +2014,12 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   desc.Alignment = 0;
   desc.Width = key().GetWidth();
   desc.Height = key().GetHeight();
+  // The wrapper keeps the key (including scaled_resolve), so its data is
+  // loaded at the draw resolution scale - size the resource to match.
+  if (key().scaled_resolve) {
+    desc.Width *= d3d12_cache.draw_resolution_scale_x();
+    desc.Height *= d3d12_cache.draw_resolution_scale_y();
+  }
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());

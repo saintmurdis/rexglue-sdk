@@ -23,6 +23,8 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <fstream>
+
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
@@ -594,7 +596,8 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream config_path_stream(config_path, std::ios::binary);
+    auto config = toml::parse(config_path_stream, config_path.string());
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;
