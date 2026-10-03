@@ -36,6 +36,9 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
+                    "Reload only the slices of 2D array textures that the GPU wrote "
+                    "(resolves) instead of the whole array.");
 REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
                     "Every 2 seconds, log which guest textures were (re)loaded and how many "
                     "host texels that took.");
@@ -1616,6 +1619,30 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
 
+  // Base slices to (re)load - only the ones the GPU wrote since the last load
+  // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.
+  uint32_t base_slice_first = 0;
+  uint32_t base_slice_count = array_size;
+  if (load_base && d3d12_texture.partial_reload_tracked() &&
+      REXCVAR_GET(texture_partial_array_reload)) {
+    uint32_t dirty_first, dirty_last;
+    bool partial;
+    {
+      auto lock = rex::thread::global_critical_region::AcquireDirect();
+      partial = d3d12_texture.GetBasePartialReload(lock, dirty_first, dirty_last);
+    }
+    uint32_t slice_stride = d3d12_texture.guest_layout().base.array_slice_stride_bytes;
+    uint32_t base_address = uint32_t(texture_key.base_page) << 12;
+    if (partial && slice_stride && dirty_first >= base_address) {
+      uint32_t first = (dirty_first - base_address) / slice_stride;
+      uint32_t last = std::min((dirty_last - base_address) / slice_stride, array_size - 1);
+      if (first <= last) {
+        base_slice_first = first;
+        base_slice_count = last - first + 1;
+      }
+    }
+  }
+
   if (REXCVAR_GET(d3d12_log_texture_loads)) {
     struct LoadStat {
       uint64_t count = 0;
@@ -1917,7 +1944,14 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     uint32_t level_array_slice_stride_bytes_scaled =
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
-    for (uint32_t slice = 0; slice < array_size; ++slice) {
+    uint32_t dispatch_slice_first = is_base ? base_slice_first : 0;
+    uint32_t dispatch_slice_end =
+        is_base ? base_slice_first + base_slice_count : array_size;
+    if (dispatch_slice_first) {
+      load_constants.guest_offset += level_array_slice_stride_bytes_scaled * dispatch_slice_first;
+      load_constants.host_offset += host_slice_size * dispatch_slice_first;
+    }
+    for (uint32_t slice = dispatch_slice_first; slice < dispatch_slice_end; ++slice) {
       if (slice != 0) {
         command_list.D3DSetComputeRoot32BitConstants(
             0, sizeof(load_constants.guest_offset) / sizeof(uint32_t), &load_constants.guest_offset,
@@ -2000,7 +2034,11 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     } else {
       source_box_ptr = nullptr;
     }
-    for (uint32_t slice = 0; slice < array_size; ++slice) {
+    uint32_t copy_slice_first = level == 0 ? base_slice_first : 0;
+    uint32_t copy_slice_end = level == 0 ? base_slice_first + base_slice_count : array_size;
+    location_dest.SubresourceIndex += texture_level_count * copy_slice_first;
+    location_source.PlacedFootprint.Offset += host_slice_size * copy_slice_first;
+    for (uint32_t slice = copy_slice_first; slice < copy_slice_end; ++slice) {
       command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
       location_dest.SubresourceIndex += texture_level_count;
       location_source.PlacedFootprint.Offset += host_slice_size;

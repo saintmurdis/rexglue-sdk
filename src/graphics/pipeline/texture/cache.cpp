@@ -228,6 +228,10 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
 TextureCache::~TextureCache() {
   DestroyAllTextures(true);
 
+  if (partial_reload_global_watch_handle_) {
+    shared_memory().UnregisterGlobalWatch(partial_reload_global_watch_handle_);
+    partial_reload_global_watch_handle_ = nullptr;
+  }
   if (scaled_resolve_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
   }
@@ -656,6 +660,19 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 
   // Never try to upload data that doesn't exist.
   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
+
+  if (key.dimension == xenos::DataDimension::k2DOrStacked && key.mip_max_level == 0 &&
+      key.GetDepthOrArraySize() > 1 && guest_layout().base.array_slice_stride_bytes != 0 &&
+      base_outdated_) {
+    partial_reload_tracked_ = true;
+    auto lock = rex::thread::global_critical_region::AcquireDirect();
+    texture_cache.partial_reload_textures_.push_back(this);
+    if (!texture_cache.partial_reload_global_watch_handle_) {
+      texture_cache.partial_reload_global_watch_handle_ =
+          texture_cache.shared_memory().RegisterGlobalWatch(
+              PartialReloadGlobalWatchCallbackThunk, &texture_cache);
+    }
+  }
   mips_outdated_ = guest_layout().mips_total_extent_bytes != 0;
   outdated_mask_.store(
       (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
@@ -663,6 +680,11 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 }
 
 TextureCache::Texture::~Texture() {
+  if (partial_reload_tracked_) {
+    auto lock = rex::thread::global_critical_region::AcquireDirect();
+    auto& list = texture_cache_.partial_reload_textures_;
+    list.erase(std::remove(list.begin(), list.end(), this), list.end());
+  }
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -692,6 +714,7 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
   if (base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
+    base_partial_valid_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
@@ -730,6 +753,52 @@ void TextureCache::Texture::MarkAsUsed() {
   used_next_ = nullptr;
   texture_cache_.texture_used_last_->used_next_ = this;
   texture_cache_.texture_used_last_ = this;
+}
+
+void TextureCache::Texture::NoteBaseWrite(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    uint32_t address_first, uint32_t address_last, bool by_gpu) {
+  uint32_t base_first = key().base_page << 12;
+  uint32_t base_last = base_first + GetGuestBaseSize() - 1;
+  if (address_last < base_first || address_first > base_last) {
+    return;
+  }
+  address_first = std::max(address_first, base_first);
+  address_last = std::min(address_last, base_last);
+  if (!base_outdated_) {
+    // First write since the last load - the per-range watch fires right
+    // after the global ones and marks the base outdated.
+    base_partial_valid_ = by_gpu;
+    base_dirty_first_ = address_first;
+    base_dirty_last_ = address_last;
+  } else if (base_partial_valid_) {
+    if (by_gpu) {
+      base_dirty_first_ = std::min(base_dirty_first_, address_first);
+      base_dirty_last_ = std::max(base_dirty_last_, address_last);
+    } else {
+      base_partial_valid_ = false;
+    }
+  }
+}
+
+bool TextureCache::Texture::GetBasePartialReload(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    uint32_t& address_first, uint32_t& address_last) const {
+  if (!partial_reload_tracked_ || !base_outdated_ || !base_partial_valid_) {
+    return false;
+  }
+  address_first = base_dirty_first_;
+  address_last = base_dirty_last_;
+  return true;
+}
+
+void TextureCache::PartialReloadGlobalWatchCallbackThunk(
+    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  auto* texture_cache = static_cast<TextureCache*>(context);
+  for (Texture* texture : texture_cache->partial_reload_textures_) {
+    texture->NoteBaseWrite(global_lock, address_first, address_last, invalidated_by_gpu);
+  }
 }
 
 void TextureCache::Texture::WatchCallback(

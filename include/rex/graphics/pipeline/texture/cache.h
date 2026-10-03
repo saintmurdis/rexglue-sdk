@@ -230,6 +230,18 @@ class TextureCache {
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
+    // Partial base reloads for 2D array textures without mips: guest code often
+    // resolves into one slice per frame, and reloading every slice each time is
+    // very expensive with resolution scaling. GPU writes to the base are
+    // accumulated here while the base is outdated; any CPU write, or a write
+    // while nothing is accumulated yet (initial load), requires a full reload.
+    bool partial_reload_tracked() const { return partial_reload_tracked_; }
+    void NoteBaseWrite(const std::unique_lock<std::recursive_mutex>& global_lock,
+                       uint32_t address_first, uint32_t address_last, bool by_gpu);
+    // Returns whether only [address_first, address_last] of the base changed.
+    bool GetBasePartialReload(const std::unique_lock<std::recursive_mutex>& global_lock,
+                              uint32_t& address_first, uint32_t& address_last) const;
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
@@ -262,6 +274,7 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    bool partial_reload_tracked_ = false;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -270,6 +283,10 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
+    // Within the global critical region, see NoteBaseWrite.
+    bool base_partial_valid_ = false;
+    uint32_t base_dirty_first_ = 0;
+    uint32_t base_dirty_last_ = 0;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -599,6 +616,13 @@ class TextureCache {
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+
+  // Textures eligible for partial base reloads, fed by a global watch.
+  static void PartialReloadGlobalWatchCallbackThunk(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  std::vector<Texture*> partial_reload_textures_;
+  SharedMemory::GlobalWatchHandle partial_reload_global_watch_handle_ = nullptr;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
