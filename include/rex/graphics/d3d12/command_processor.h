@@ -185,6 +185,20 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Sets the current cached values to external ones. This is for cache
   // invalidation primarily. A submission must be open.
+  // GPU time profiling (--d3d12_gpu_profile). Work recorded between
+  // GpuProfilePush/Pop is attributed to the category; everything else counts
+  // as guest drawing.
+  enum class GpuProfileCategory : uint32_t {
+    kDraw,
+    kTransfer,
+    kResolve,
+    kTextureLoad,
+    kSwap,
+    kCount,
+  };
+  void GpuProfilePush(GpuProfileCategory category);
+  void GpuProfilePop();
+
   void SetExternalPipeline(ID3D12PipelineState* pipeline);
   // Bisects deferred_command_list_ after its Close() failed and logs the
   // offending command (see the d3d12_diagnose_invalid_command_lists cvar).
@@ -429,6 +443,28 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   bool submission_open_ = false;
   // Values of submission_fence_.
+  // GPU time profiling state.
+  void GpuProfileMark();
+  void GpuProfileEndSubmission();
+  void GpuProfileCollect();
+  static constexpr uint32_t kGpuProfileQueryCount = 16384;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_profile_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_profile_readback_;
+  const uint64_t* gpu_profile_readback_mapping_ = nullptr;
+  uint64_t gpu_profile_frequency_ = 0;
+  uint32_t gpu_profile_next_query_ = 0;
+  std::vector<GpuProfileCategory> gpu_profile_stack_;
+  struct GpuProfileSubmission {
+    uint64_t submission;
+    uint32_t first_query;
+    std::vector<GpuProfileCategory> segment_categories;  // one per mark
+  };
+  GpuProfileSubmission gpu_profile_open_;
+  std::deque<GpuProfileSubmission> gpu_profile_pending_;
+  double gpu_profile_totals_ms_[size_t(GpuProfileCategory::kCount)] = {};
+  uint64_t gpu_profile_window_start_ = 0;
+  uint32_t gpu_profile_window_swaps_ = 0;
+
   uint64_t submission_current_ = 1;
   uint64_t submission_completed_ = 0;
   ID3D12Fence* submission_fence_ = nullptr;

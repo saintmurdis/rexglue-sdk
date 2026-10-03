@@ -3799,6 +3799,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
+  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kTransfer);
+  struct GpuProfilePop {
+    D3D12CommandProcessor& cp;
+    ~GpuProfilePop() { cp.GpuProfilePop(); }
+  } gpu_profile_pop{command_processor_};
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();

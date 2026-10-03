@@ -36,6 +36,10 @@ REXCVAR_DEFINE_BOOL(d3d12_diagnose_invalid_command_lists, false, "GPU/D3D12",
                     "When a command list fails Close() (the device is then removed with "
                     "INVALID_CALL), bisect it and log the first invalid command. Works "
                     "without the D3D12 debug layer.");
+REXCVAR_DEFINE_BOOL(d3d12_gpu_profile, false, "GPU/D3D12",
+                    "Measure GPU time per category (guest draws, render target transfers, "
+                    "resolves, texture loads, swap) with timestamp queries and log it "
+                    "every 2 seconds.");
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -806,6 +810,96 @@ void D3D12CommandProcessor::DiagnoseInvalidCommandList() {
   }
 }
 
+void D3D12CommandProcessor::GpuProfilePush(GpuProfileCategory category) {
+  if (!gpu_profile_query_heap_)
+    return;
+  gpu_profile_stack_.push_back(category);
+  GpuProfileMark();
+}
+
+void D3D12CommandProcessor::GpuProfilePop() {
+  if (!gpu_profile_query_heap_ || gpu_profile_stack_.empty())
+    return;
+  gpu_profile_stack_.pop_back();
+  GpuProfileMark();
+}
+
+void D3D12CommandProcessor::GpuProfileMark() {
+  // Timestamps go into the deferred list, so only mark inside a submission and
+  // keep a submission's queries contiguous (no wrap in the middle).
+  if (!submission_open_ || gpu_profile_next_query_ >= kGpuProfileQueryCount)
+    return;
+  if (gpu_profile_open_.segment_categories.empty()) {
+    gpu_profile_open_.first_query = gpu_profile_next_query_;
+  }
+  deferred_command_list_.D3DEndQuery(gpu_profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     gpu_profile_next_query_++);
+  gpu_profile_open_.segment_categories.push_back(
+      gpu_profile_stack_.empty() ? GpuProfileCategory::kDraw : gpu_profile_stack_.back());
+}
+
+void D3D12CommandProcessor::GpuProfileEndSubmission() {
+  if (!gpu_profile_query_heap_)
+    return;
+  GpuProfileMark();
+  auto& open = gpu_profile_open_;
+  if (open.segment_categories.size() >= 2) {
+    uint32_t count = uint32_t(open.segment_categories.size());
+    deferred_command_list_.D3DResolveQueryData(gpu_profile_query_heap_.Get(),
+                                               D3D12_QUERY_TYPE_TIMESTAMP, open.first_query, count,
+                                               gpu_profile_readback_.Get(),
+                                               uint64_t(open.first_query) * sizeof(uint64_t));
+    open.submission = submission_current_;
+    gpu_profile_pending_.push_back(std::move(open));
+  }
+  open = {};
+}
+
+void D3D12CommandProcessor::GpuProfileCollect() {
+  if (!gpu_profile_query_heap_)
+    return;
+  while (!gpu_profile_pending_.empty() &&
+         gpu_profile_pending_.front().submission <= submission_completed_) {
+    const auto& done = gpu_profile_pending_.front();
+    const uint64_t* ts = gpu_profile_readback_mapping_ + done.first_query;
+    for (size_t i = 0; i + 1 < done.segment_categories.size(); ++i) {
+      if (ts[i + 1] > ts[i]) {
+        gpu_profile_totals_ms_[size_t(done.segment_categories[i])] +=
+            double(ts[i + 1] - ts[i]) * 1000.0 / double(gpu_profile_frequency_);
+      }
+    }
+    gpu_profile_pending_.pop_front();
+  }
+  // Queries are reused once nothing in flight references them.
+  if (gpu_profile_pending_.empty() && gpu_profile_open_.segment_categories.empty()) {
+    gpu_profile_next_query_ = 0;
+  }
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+  if (!gpu_profile_window_start_) {
+    gpu_profile_window_start_ = now;
+    return;
+  }
+  double window_s = double(now - gpu_profile_window_start_) / double(freq);
+  if (window_s < 2.0)
+    return;
+  static const char* const kNames[] = {"draw", "transfer", "resolve", "texload", "swap"};
+  double total = 0;
+  std::string text;
+  for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
+    total += gpu_profile_totals_ms_[i];
+  }
+  double frames = std::max(1u, gpu_profile_window_swaps_);
+  for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
+    text += fmt::format(" {}={:.2f}ms", kNames[i], gpu_profile_totals_ms_[i] / frames);
+    gpu_profile_totals_ms_[i] = 0;
+  }
+  REXGPU_INFO("GPU profile: {:.1f} fps, GPU busy {:.0f}%, per frame:{}",
+              gpu_profile_window_swaps_ / window_s, total / (window_s * 10.0), text);
+  gpu_profile_window_swaps_ = 0;
+  gpu_profile_window_start_ = now;
+}
+
 void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
   if (current_external_pipeline_ != pipeline) {
     current_external_pipeline_ = pipeline;
@@ -966,6 +1060,30 @@ bool D3D12CommandProcessor::SetupContext() {
         "The requested draw resolution scale is not supported by the device or "
         "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
+  }
+
+  if (REXCVAR_GET(d3d12_gpu_profile)) {
+    D3D12_QUERY_HEAP_DESC query_heap_desc = {};
+    query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_heap_desc.Count = kGpuProfileQueryCount;
+    D3D12_RESOURCE_DESC readback_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        readback_desc, kGpuProfileQueryCount * sizeof(uint64_t), D3D12_RESOURCE_FLAG_NONE);
+    void* readback_mapping = nullptr;
+    if (SUCCEEDED(provider.GetDevice()->CreateQueryHeap(&query_heap_desc,
+                                                        IID_PPV_ARGS(&gpu_profile_query_heap_))) &&
+        SUCCEEDED(provider.GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu_profile_readback_))) &&
+        SUCCEEDED(gpu_profile_readback_->Map(0, nullptr, &readback_mapping)) &&
+        SUCCEEDED(provider.GetDirectQueue()->GetTimestampFrequency(&gpu_profile_frequency_))) {
+      gpu_profile_readback_mapping_ = static_cast<const uint64_t*>(readback_mapping);
+      REXGPU_INFO("GPU profiling enabled ({} Hz timestamps)", gpu_profile_frequency_);
+    } else {
+      REXGPU_ERROR("Failed to set up GPU profiling");
+      gpu_profile_query_heap_.Reset();
+      gpu_profile_readback_.Reset();
+    }
   }
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
@@ -1953,6 +2071,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
     return;
   }
+  ++gpu_profile_window_swaps_;
+  GpuProfilePush(GpuProfileCategory::kSwap);
+  struct GpuProfileSwapPop {
+    D3D12CommandProcessor* self;
+    ~GpuProfileSwapPop() { self->GpuProfilePop(); }
+  } gpu_profile_swap_pop{this};
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
@@ -2914,6 +3038,11 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
+  GpuProfilePush(GpuProfileCategory::kResolve);
+  struct GpuProfileCopyPop {
+    D3D12CommandProcessor* self;
+    ~GpuProfileCopyPop() { self->GpuProfilePop(); }
+  } gpu_profile_copy_pop{this};
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3187,6 +3316,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed_ < await_submission) {
     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
   }
+  GpuProfileCollect();
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return;
@@ -3345,6 +3475,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    GpuProfileMark();
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3468,6 +3599,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    GpuProfileEndSubmission();
     deferred_command_list_.Execute(command_list_, command_list_1_);
     if (HRESULT close_result = command_list_->Close(); FAILED(close_result)) {
       REXGPU_ERROR("D3D12 command list Close failed: 0x{:08X}", uint32_t(close_result));
