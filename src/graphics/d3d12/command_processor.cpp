@@ -827,7 +827,8 @@ void D3D12CommandProcessor::GpuProfilePop() {
 void D3D12CommandProcessor::GpuProfileMark() {
   // Timestamps go into the deferred list, so only mark inside a submission and
   // keep a submission's queries contiguous (no wrap in the middle).
-  if (!submission_open_ || gpu_profile_next_query_ >= kGpuProfileQueryCount)
+  if (!gpu_profile_query_heap_ || !submission_open_ ||
+      gpu_profile_next_query_ >= kGpuProfileQueryCount)
     return;
   if (gpu_profile_open_.segment_categories.empty()) {
     gpu_profile_open_.first_query = gpu_profile_next_query_;
