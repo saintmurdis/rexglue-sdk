@@ -3505,10 +3505,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
           } else if (dest_is_color &&
                      (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
-            if (source_color_format != dest_color_format) {
+            if (source_color_format != dest_color_format && gamma_render_target_as_unorm16_) {
               // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+              // k_8_8_8_8_GAMMA. _GAMMA is stored as linear in R16G16B16A16_UNORM,
+              // so converting to plain k_8_8_8_8 encodes gamma, and converting to
+              // _GAMMA decodes. As R8G8B8A8_UNORM, both hold the same bits.
+              if (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
                 for (uint32_t i = 0; i < 3; ++i) {
                   source_color[0][i] = LinearToPWLGamma(source_color[0][i], true);
                 }
