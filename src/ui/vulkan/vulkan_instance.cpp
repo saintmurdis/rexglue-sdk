@@ -134,9 +134,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // #129.
   requested_extensions.emplace("VK_EXT_debug_utils",
                                &vulkan_instance->extensions_.ext_EXT_debug_utils);
-  // #395.
+  // #395. Only needed for portability subset implementations (MoltenVK);
+  // capture layers such as RenderDoc reject it at instance creation.
+#if REX_PLATFORM_MAC
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
+#endif
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);

@@ -34,6 +34,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/ui/renderdoc_api.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -64,6 +65,9 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(renderdoc_capture_swap, 0, "GPU/Vulkan",
+                     "Debug: capture the guest frame after this many swaps in RenderDoc "
+                     "(0 = off)");
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -2287,6 +2291,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
+  }
+
+  // Debug: capture all guest GPU work between two guest swaps in RenderDoc
+  // (host presentation runs at its own rate, so the host frame boundary
+  // doesn't contain the guest frame).
+  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap > 0) {
+    static uint32_t swap_counter = 0;
+    static std::unique_ptr<ui::RenderDocAPI> renderdoc_api = ui::RenderDocAPI::CreateIfConnected();
+    ++swap_counter;
+    if (swap_counter == uint32_t(capture_swap) || swap_counter == uint32_t(capture_swap) + 1) {
+      if (renderdoc_api) {
+        // Put the guest work recorded so far on the right side of the range.
+        EndSubmission(false);
+        if (swap_counter == uint32_t(capture_swap)) {
+          renderdoc_api->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
+          REXGPU_INFO("RenderDoc capture started at swap {}", swap_counter);
+        } else {
+          AwaitAllQueueOperationsCompletion();
+          renderdoc_api->api_1_0_0()->EndFrameCapture(nullptr, nullptr);
+          REXGPU_INFO("RenderDoc capture ended at swap {}", swap_counter);
+        }
+        BeginSubmission(true);
+      } else if (swap_counter == uint32_t(capture_swap)) {
+        REXGPU_WARN("renderdoc_capture_swap is set, but RenderDoc is not attached");
+      }
+    }
   }
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&

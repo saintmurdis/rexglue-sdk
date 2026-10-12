@@ -3735,6 +3735,11 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                                         builder.makeUintConstant(8), builder.makeUintConstant(24));
         }
       }
+    } else if (mode.output == TransferOutput::kStencilBit && source_stencil[0] != spv::NoResult) {
+      // Depth -> stencil bit: only the stencil is loaded, and it's in the low
+      // 8 bits of the packed value. Without this, nothing kills the samples
+      // whose bit is not set, and the stencil ends up 0xFF everywhere.
+      packed = source_stencil[0];
     }
     switch (mode.output) {
       case TransferOutput::kColor: {

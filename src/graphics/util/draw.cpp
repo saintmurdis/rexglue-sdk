@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <set>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -27,6 +29,9 @@
 #include <rex/ui/graphics_util.h>
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
+REXCVAR_DEFINE_BOOL(log_resolves, false, "GPU",
+                    "Log each distinct resolve configuration (source format, destination "
+                    "format, copy shader) once");
 
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
@@ -1164,6 +1169,31 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
         break;
       default:
         assert_unhandled_case(dest_format_info.bits_per_pixel);
+    }
+  }
+
+  if (REXCVAR_GET(log_resolves)) {
+    static std::mutex logged_mutex;
+    static std::set<std::pair<uint32_t, uint32_t>> logged;
+    // Coordinates and base addresses vary per resolve; key by format state.
+    uint32_t key_edram = edram_info.packed & ~((1u << xenos::kEdramPitchTilesBits) - 1);
+    uint32_t key_dest = copy_dest_info.value & ~(0x7u << 4);
+    key_dest ^= uint32_t(copy_dest_coordinate_info.copy_sample_select) << 28;
+    std::lock_guard<std::mutex> lock(logged_mutex);
+    if (logged.emplace(key_edram, key_dest).second) {
+      REXGPU_INFO(
+          "Resolve: {} format {} msaa {} 64bpp {} -> dest format {} number {} endian {} "
+          "exp_bias {} swap {} array {} sample_select {}, shader {}, {}x{} at {:08X}",
+          is_depth ? "depth" : "color", uint32_t(edram_info.format),
+          1u << uint32_t(edram_info.msaa_samples), uint32_t(edram_info.format_is_64bpp),
+          uint32_t(copy_dest_info.copy_dest_format), uint32_t(copy_dest_info.copy_dest_number),
+          uint32_t(copy_dest_info.copy_dest_endian), int32_t(copy_dest_info.copy_dest_exp_bias),
+          uint32_t(copy_dest_info.copy_dest_swap), uint32_t(copy_dest_info.copy_dest_array),
+          uint32_t(copy_dest_coordinate_info.copy_sample_select),
+          shader != ResolveCopyShaderIndex::kUnknown
+              ? resolve_copy_shader_info[size_t(shader)].debug_name
+              : "unknown",
+          coordinate_info.width_div_8 << 3, height_div_8 << 3, copy_dest_base);
     }
   }
 
