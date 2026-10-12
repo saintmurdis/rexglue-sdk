@@ -2296,6 +2296,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // Debug: capture all guest GPU work between two guest swaps in RenderDoc
   // (host presentation runs at its own rate, so the host frame boundary
   // doesn't contain the guest frame).
+#if !REX_PLATFORM_MAC  // RenderDoc is unavailable (and its API header not included) on macOS.
   if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap != 0) {
     static uint32_t swap_counter = 0;
     static std::unique_ptr<ui::RenderDocAPI> renderdoc_api = ui::RenderDocAPI::CreateIfConnected();
@@ -2328,6 +2329,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       }
     }
   }
+#endif  // !REX_PLATFORM_MAC
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
