@@ -36,9 +36,7 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
-REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
-                    "Reload only the slices of 2D array textures that the GPU wrote "
-                    "(resolves) instead of the whole array.");
+REXCVAR_DECLARE(bool, texture_partial_array_reload);
 REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
                     "Every 2 seconds, log which guest textures were (re)loaded and how many "
                     "host texels that took.");

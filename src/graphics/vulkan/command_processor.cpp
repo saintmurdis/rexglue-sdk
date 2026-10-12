@@ -67,7 +67,7 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 
 REXCVAR_DEFINE_INT32(renderdoc_capture_swap, 0, "GPU/Vulkan",
                      "Debug: capture the guest frame after this many swaps in RenderDoc "
-                     "(0 = off)");
+                     "(0 = off, -1 = when F11 is pressed, Windows only)");
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -2296,10 +2296,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // Debug: capture all guest GPU work between two guest swaps in RenderDoc
   // (host presentation runs at its own rate, so the host frame boundary
   // doesn't contain the guest frame).
-  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap > 0) {
+  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap != 0) {
     static uint32_t swap_counter = 0;
     static std::unique_ptr<ui::RenderDocAPI> renderdoc_api = ui::RenderDocAPI::CreateIfConnected();
     ++swap_counter;
+#if REX_PLATFORM_WINDOWS
+    // -1: capture the guest frame after F11 is pressed.
+    static uint32_t hotkey_capture_swap = 0;
+    if (capture_swap < 0) {
+      if ((GetAsyncKeyState(VK_F11) & 0x8000) && swap_counter > hotkey_capture_swap + 120) {
+        hotkey_capture_swap = swap_counter + 1;
+      }
+      capture_swap = int32_t(hotkey_capture_swap);
+    }
+#endif
     if (swap_counter == uint32_t(capture_swap) || swap_counter == uint32_t(capture_swap) + 1) {
       if (renderdoc_api) {
         // Put the guest work recorded so far on the right side of the range.
@@ -3872,6 +3882,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
+  }
+  // Track depth render targets the guest may write a nonzero stencil to (see
+  // VulkanRenderTarget::stencil_maybe_nonzero).
+  if (normalized_depth_control.stencil_enable) {
+    render_target_cache_->MarkBoundDepthStencilMaybeNonzero();
   }
 
   // Create the pipeline (for this, need the render pass from the render target

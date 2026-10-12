@@ -32,6 +32,9 @@ class VulkanCommandProcessor;
 
 class VulkanRenderTargetCache final : public RenderTargetCache {
  public:
+  // Called for draws that may write the stencil of the bound depth target.
+  void MarkBoundDepthStencilMaybeNonzero();
+
   union RenderPassKey {
     struct {
       // If emulating 2x as 4x, this is still 2x for simplicity of using this
@@ -361,6 +364,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
+    // Conservative: false only if nothing could have written a nonzero
+    // stencil value to this depth render target - then transferring its
+    // stencil without VK_EXT_shader_stencil_export (8 bit draws) is skipped.
+    bool stencil_maybe_nonzero() const { return stencil_maybe_nonzero_; }
+    void SetStencilMaybeNonzero() { stencil_maybe_nonzero_ = true; }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
 
@@ -384,6 +393,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VkImageLayout current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Temporary storage for indices in operations like transfers and dumps.
+    bool stencil_maybe_nonzero_ = false;
     uint32_t temporary_sort_index_ = 0;
   };
 

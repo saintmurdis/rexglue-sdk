@@ -33,6 +33,7 @@
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, texture_partial_array_reload);
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
 namespace rex::graphics::vulkan {
@@ -1364,6 +1365,54 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
   }
+  // Base slices to (re)load - only the ones the GPU wrote since the last load
+  // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all. Tiled
+  // 3D textures are reloaded by groups of 8 depth slices, the period of the 3D
+  // tiling. The host buffer layout stays the same, only part of it is filled.
+  uint32_t base_slice_first = 0;
+  uint32_t base_slice_count = array_size;
+  constexpr uint32_t kZGroupDepth = 8;
+  uint32_t base_z_first = 0;
+  uint32_t base_z_count = depth;
+  uint32_t base_z_group_stride = 0;
+  if (load_base && vulkan_texture.partial_reload_tracked() &&
+      REXCVAR_GET(texture_partial_array_reload)) {
+    uint32_t dirty_first, dirty_last;
+    bool partial;
+    {
+      auto lock = rex::thread::global_critical_region::AcquireDirect();
+      partial = vulkan_texture.GetBasePartialReload(lock, dirty_first, dirty_last);
+    }
+    const texture_util::TextureGuestLayout::Level& base_layout = guest_layout.base;
+    uint32_t base_address = uint32_t(texture_key.base_page) << 12;
+    if (is_3d) {
+      base_z_group_stride = uint32_t(texture_util::GetTiledOffset3D(
+          0, 0, int32_t(kZGroupDepth), base_layout.row_pitch_bytes / bytes_per_block,
+          base_layout.z_slice_stride_block_rows, rex::log2_floor(bytes_per_block)));
+      if (partial && base_z_group_stride && dirty_first >= base_address) {
+        uint32_t z_first = (dirty_first - base_address) / base_z_group_stride * kZGroupDepth;
+        uint32_t z_end = std::min(
+            ((dirty_last - base_address) / base_z_group_stride + 1) * kZGroupDepth, depth);
+        if (z_first < z_end) {
+          base_z_first = z_first;
+          base_z_count = z_end - z_first;
+        }
+      }
+    } else if (partial && base_layout.array_slice_stride_bytes && dirty_first >= base_address) {
+      uint32_t first = (dirty_first - base_address) / base_layout.array_slice_stride_bytes;
+      uint32_t last = std::min((dirty_last - base_address) / base_layout.array_slice_stride_bytes,
+                               array_size - 1);
+      if (first <= last) {
+        base_slice_first = first;
+        base_slice_count = last - first + 1;
+      }
+    }
+  }
+  // Bytes of one depth slice of the base in the host buffer.
+  VkDeviceSize host_base_z_slice_bytes = VkDeviceSize(load_shader_info.bytes_per_host_block) *
+                                         host_layout_base.x_pitch_blocks *
+                                         host_layout_base.y_pitch_blocks;
+
   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
       command_processor_.AcquireScratchGpuBuffer(
           host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
@@ -1591,14 +1640,31 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     load_constants.host_pitch =
         load_shader_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
 
-    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                      sizeof(load_constants), &load_constants);
+    if (is_base && is_3d && base_z_count != depth) {
+      // The tiled 3D address is linear in whole groups of 8 slices, so the
+      // shader can start at a group boundary with only the offsets shifted.
+      load_constants.guest_offset += base_z_group_stride * (base_z_first / kZGroupDepth) *
+                                     (texture_resolution_scale_x * texture_resolution_scale_y);
+      load_constants.host_offset += uint32_t(host_base_z_slice_bytes * base_z_first);
+      load_constants.size_blocks[2] = base_z_count;
+    }
 
     uint32_t level_array_slice_stride_bytes_scaled =
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
-    for (uint32_t slice = 0; slice < array_size; ++slice) {
-      if (slice != 0) {
+    uint32_t dispatch_slice_first = is_base ? base_slice_first : 0;
+    uint32_t dispatch_slice_end = is_base ? base_slice_first + base_slice_count : array_size;
+    if (dispatch_slice_first) {
+      load_constants.guest_offset += level_array_slice_stride_bytes_scaled * dispatch_slice_first;
+      load_constants.host_offset +=
+          uint32_t(level_host_layout.slice_size_bytes * dispatch_slice_first);
+    }
+
+    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(load_constants), &load_constants);
+
+    for (uint32_t slice = dispatch_slice_first; slice < dispatch_slice_end; ++slice) {
+      if (slice != dispatch_slice_first) {
         command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, guest_offset),
                                           sizeof(load_constants.guest_offset),
@@ -1781,6 +1847,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.height =
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+    if (level == 0) {
+      // Partial base reloads - only copy what was loaded.
+      if (is_3d && base_z_count != depth) {
+        copy_region.bufferOffset += host_base_z_slice_bytes * base_z_first;
+        copy_region.imageOffset.z = int32_t(base_z_first);
+        copy_region.imageExtent.depth = base_z_count;
+      } else if (base_slice_count != array_size) {
+        copy_region.bufferOffset += host_layout_base.slice_size_bytes * base_slice_first;
+        copy_region.imageSubresource.baseArrayLayer = base_slice_first;
+        copy_region.imageSubresource.layerCount = base_slice_count;
+      }
+    }
   }
 
   return true;

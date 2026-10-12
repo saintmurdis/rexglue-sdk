@@ -45,6 +45,9 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
     .range(1, 3600);
 
+REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
+                    "Reload only the slices of 2D array textures (and the depth ranges of "
+                    "tiled 3D textures) that the GPU wrote instead of the whole texture.");
 REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

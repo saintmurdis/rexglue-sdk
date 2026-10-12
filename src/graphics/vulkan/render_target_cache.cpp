@@ -37,6 +37,9 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_skip_zero_stencil_transfers, true, "GPU/Vulkan",
+                    "Without VK_EXT_shader_stencil_export, skip the per-bit stencil transfer "
+                    "draws from depth render targets whose stencil can only be zero");
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -1312,6 +1315,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle,
                                                  clear_render_targets[0], clear_transfers_[0],
                                                  clear_render_targets[1], clear_transfers_[1])) {
+          if (clear_render_targets[0] && (resolve_info.rb_depth_clear & 0xFF)) {
+            static_cast<VulkanRenderTarget*>(clear_render_targets[0])->SetStencilMaybeNonzero();
+          }
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
           clear_values[1] =
@@ -1717,6 +1723,16 @@ bool VulkanRenderTargetCache::IsColor16FormatFloatLike(
       return true;
     default:
       return false;
+  }
+}
+
+void VulkanRenderTargetCache::MarkBoundDepthStencilMaybeNonzero() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  RenderTarget* depth_rt = last_update_accumulated_render_targets()[0];
+  if (depth_rt) {
+    static_cast<VulkanRenderTarget*>(depth_rt)->SetStencilMaybeNonzero();
   }
 }
 
@@ -4903,6 +4919,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             stencil_clear_rectangle_count += transfer.GetRectangles(
                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
                 nullptr, resolve_clear_rectangle);
+            // The stencil is cleared to zero before the bit draws - if the
+            // source stencil can only be zero, the bit draws would do nothing.
+            if (source_rt_key.is_depth && !source_vulkan_rt.stencil_maybe_nonzero() &&
+                REXCVAR_GET(vulkan_skip_zero_stencil_transfers)) {
+              continue;
+            }
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_vulkan_rt) {
@@ -4931,6 +4953,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
+      if (dest_rt_key.is_depth) {
+        for (const Transfer& transfer : current_transfers) {
+          auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(transfer.source);
+          if (!source_vulkan_rt.key().is_depth || source_vulkan_rt.stencil_maybe_nonzero()) {
+            dest_vulkan_rt.SetStencilMaybeNonzero();
+          }
+        }
+      }
 
       for (auto it = current_transfer_invocations_.cbegin();
            it != current_transfer_invocations_.cend(); ++it) {
