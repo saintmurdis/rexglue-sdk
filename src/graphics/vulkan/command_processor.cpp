@@ -4194,6 +4194,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+        if (shared_memory_->direct_upload_enabled()) {
+          // Not requested again, but still read in this submission.
+          shared_memory_->MarkRangeUsedByCurrentSubmission(vfetch_constant.address << 2,
+                                                           vfetch_constant.size << 2);
+        }
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
@@ -5362,6 +5367,14 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(GetCurrentSubmission());
+
+    if (shared_memory_->direct_upload_enabled()) {
+      // Direct shared memory uploads need every submission that reads a vertex
+      // buffer to be known, not only the one that requested it, so recheck
+      // vertex buffers in each submission.
+      vertex_buffers_in_sync_[0] = 0;
+      vertex_buffers_in_sync_[1] = 0;
+    }
   }
 
   if (is_opening_frame) {

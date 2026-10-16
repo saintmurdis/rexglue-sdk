@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
@@ -26,6 +27,19 @@
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_direct_upload, false, "GPU/Vulkan",
+                    "On unified memory GPUs (such as Apple silicon), place shared memory in "
+                    "host-visible device-local memory and write guest data to it from the CPU "
+                    "when no GPU work submitted or recorded may be using the pages, instead of "
+                    "copying it on the GPU, which ends the render pass")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_direct_upload_skip_unchanged, false, "GPU/Vulkan",
+                    "With vulkan_shared_memory_direct_upload, compare pages that GPU work may "
+                    "still be reading with guest memory, and skip uploading them if unchanged "
+                    "(such as after clear_memory_page_state) instead of copying them on the GPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -50,6 +64,15 @@ bool VulkanSharedMemory::Initialize() {
   const VkBufferCreateFlags sparse_flags =
       VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
 
+  // Memory types that both the GPU and the CPU can access directly, for direct
+  // uploads. The buffer is mapped as a whole then, so it's not sparse.
+  uint32_t direct_upload_memory_types = 0;
+  if (REXCVAR_GET(vulkan_shared_memory_direct_upload)) {
+    direct_upload_memory_types = vulkan_device->memory_types().device_local &
+                                 vulkan_device->memory_types().host_visible &
+                                 vulkan_device->memory_types().host_coherent;
+  }
+
   // Try to create a sparse buffer.
   VkBufferCreateInfo buffer_create_info;
   buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -61,7 +84,7 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  if (REXCVAR_GET(vulkan_sparse_shared_memory) && !direct_upload_memory_types &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
@@ -113,7 +136,14 @@ bool VulkanSharedMemory::Initialize() {
     }
     VkMemoryRequirements buffer_memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
-    if (!rex::bit_scan_forward(
+    // For direct uploads, pick a host-visible type explicitly - the first
+    // device-local one may be GPU-only (on MoltenVK, it's Private, followed by
+    // Shared).
+    bool direct_upload_memory_type_used = rex::bit_scan_forward(
+        buffer_memory_requirements.memoryTypeBits & direct_upload_memory_types,
+        &buffer_memory_type_);
+    if (!direct_upload_memory_type_used &&
+        !rex::bit_scan_forward(
             buffer_memory_requirements.memoryTypeBits & vulkan_device->memory_types().device_local,
             &buffer_memory_type_)) {
       REXGPU_ERROR(
@@ -155,6 +185,28 @@ bool VulkanSharedMemory::Initialize() {
       Shutdown();
       return false;
     }
+    if (direct_upload_memory_type_used) {
+      void* direct_upload_mapping;
+      if (dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &direct_upload_mapping) ==
+          VK_SUCCESS) {
+        direct_upload_mapping_ = reinterpret_cast<uint8_t*>(direct_upload_mapping);
+        size_t page_count = size_t(kBufferSize >> page_size_log2());
+        page_gpu_use_submissions_.assign(page_count, 0);
+        page_gpu_write_submissions_.assign(page_count, 0);
+        page_copy_submissions_.assign(page_count, 0);
+        page_copy_sources_.assign(page_count, nullptr);
+      } else {
+        REXGPU_ERROR("Shared memory: Failed to map the Vulkan buffer for direct uploads");
+      }
+    }
+  }
+  if (REXCVAR_GET(vulkan_shared_memory_direct_upload)) {
+    if (direct_upload_mapping_) {
+      REXGPU_INFO("Shared memory: Direct uploads to Vulkan memory type {}, {} KB pages",
+                  buffer_memory_type_, (uint32_t(1) << page_size_log2()) >> 10);
+    } else {
+      REXGPU_INFO("Shared memory: Direct uploads are not available, uploading with GPU copies");
+    }
   }
 
   // The first usage will likely be uploading.
@@ -176,6 +228,13 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // Freeing the memory also unmaps it.
+  direct_upload_mapping_ = nullptr;
+  page_gpu_use_submissions_.clear();
+  page_gpu_write_submissions_.clear();
+  page_copy_submissions_.clear();
+  page_copy_sources_.clear();
+
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
   for (VkDeviceMemory memory : buffer_memory_) {
     dfn.vkFreeMemory(device, memory, nullptr);
@@ -195,6 +254,26 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
 
 void VulkanSharedMemory::EndSubmission() {
   upload_buffer_pool_->FlushWrites();
+
+  if (direct_upload_mapping_) {
+    uint64_t time_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+    if (time_ms - direct_upload_stats_time_ms_ >= 5000) {
+      if (direct_upload_stats_time_ms_) {
+        REXGPU_INFO(
+            "Shared memory direct upload: {} uploads, {} still copied on the GPU; pages: {} "
+            "written directly, {} unchanged, {} copied",
+            direct_upload_stats_calls_, direct_upload_stats_copy_calls_,
+            direct_upload_stats_pages_written_, direct_upload_stats_pages_unchanged_,
+            direct_upload_stats_pages_copied_);
+      }
+      direct_upload_stats_time_ms_ = time_ms;
+      direct_upload_stats_calls_ = 0;
+      direct_upload_stats_copy_calls_ = 0;
+      direct_upload_stats_pages_written_ = 0;
+      direct_upload_stats_pages_unchanged_ = 0;
+      direct_upload_stats_pages_copied_ = 0;
+    }
+  }
 }
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
@@ -224,7 +303,44 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
+  // Copy uploads mark their exact pages in UploadRangesWithCopy instead, as
+  // their barrier range also covers the gaps between the copied ranges, and
+  // their data is known.
+  if (direct_upload_mapping_ && written_range.second && usage != Usage::kTransferDestination) {
+    MarkPagesForCurrentSubmission(page_gpu_use_submissions_, written_range.first,
+                                  written_range.second);
+    MarkPagesForCurrentSubmission(page_gpu_write_submissions_, written_range.first,
+                                  written_range.second);
+  }
   last_written_range_ = written_range;
+}
+
+void VulkanSharedMemory::MarkRangeUsedByCurrentSubmission(uint32_t start, uint32_t length) {
+  if (direct_upload_mapping_) {
+    MarkPagesForCurrentSubmission(page_gpu_use_submissions_, start, length);
+  }
+}
+
+void VulkanSharedMemory::RangesRequested(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  if (!direct_upload_mapping_) {
+    return;
+  }
+  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
+    MarkPagesForCurrentSubmission(page_gpu_use_submissions_, range.first, range.second);
+  }
+}
+
+void VulkanSharedMemory::MarkPagesForCurrentSubmission(std::vector<uint64_t>& page_submissions,
+                                                       uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2();
+  uint32_t page_last = (start + length - 1) >> page_size_log2();
+  std::fill(page_submissions.begin() + page_first, page_submissions.begin() + (page_last + 1),
+            command_processor_.GetCurrentSubmission());
 }
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -269,6 +385,96 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
 }
 
 bool VulkanSharedMemory::UploadRanges(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  if (!direct_upload_mapping_) {
+    return UploadRangesWithCopy(upload_page_ranges);
+  }
+  ++direct_upload_stats_calls_;
+  UploadRangesDirectly(upload_page_ranges);
+  if (direct_upload_copy_page_ranges_.empty()) {
+    return true;
+  }
+  ++direct_upload_stats_copy_calls_;
+  return UploadRangesWithCopy(direct_upload_copy_page_ranges_);
+}
+
+void VulkanSharedMemory::UploadRangesDirectly(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  direct_upload_copy_page_ranges_.clear();
+  // A CPU write to a page is safe only if no GPU work may still access it -
+  // neither a submission in flight, nor commands already recorded in the
+  // current submission, which will execute after the write. Such a write needs
+  // no barrier: vkQueueSubmit makes earlier host writes to host-coherent memory
+  // visible to the submitted commands. Pages that GPU work may still access are
+  // uploaded with a copy instead, ordered with that work on the GPU.
+  // The completed submission is only updated when a submission begins, so this
+  // is conservative within a submission.
+  const uint64_t submission_completed = command_processor_.GetCompletedSubmission();
+  const bool skip_unchanged = REXCVAR_GET(vulkan_shared_memory_direct_upload_skip_unchanged);
+  auto append_copy_pages = [this](uint32_t page_first, uint32_t page_count) {
+    direct_upload_stats_pages_copied_ += page_count;
+    if (!direct_upload_copy_page_ranges_.empty()) {
+      std::pair<uint32_t, uint32_t>& last_range = direct_upload_copy_page_ranges_.back();
+      if (last_range.first + last_range.second == page_first) {
+        last_range.second += page_count;
+        return;
+      }
+    }
+    direct_upload_copy_page_ranges_.emplace_back(page_first, page_count);
+  };
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+    uint32_t page = upload_range.first;
+    uint32_t page_end = upload_range.first + upload_range.second;
+    while (page < page_end) {
+      // Take the run of pages that are all unused, or all possibly used, by the
+      // GPU work that hasn't completed yet.
+      bool page_in_use = page_gpu_use_submissions_[page] > submission_completed;
+      uint32_t run_end = page + 1;
+      while (run_end < page_end &&
+             (page_gpu_use_submissions_[run_end] > submission_completed) == page_in_use) {
+        ++run_end;
+      }
+      uint32_t run_start_bytes = page << page_size_log2();
+      uint32_t run_length_bytes = (run_end - page) << page_size_log2();
+      if (!page_in_use) {
+        MakeRangeValid(run_start_bytes, run_length_bytes, false);
+        std::memcpy(direct_upload_mapping_ + run_start_bytes,
+                    memory().TranslatePhysical(run_start_bytes), run_length_bytes);
+        direct_upload_stats_pages_written_ += run_end - page;
+      } else if (!skip_unchanged) {
+        append_copy_pages(page, run_end - page);
+      } else {
+        // Data uploaded again without having been modified (such as after
+        // clear_memory_page_state) doesn't need uploading. Compare it with
+        // what the page will contain after the GPU work that may still write
+        // to it: the source of the last copy upload if that copy may still be
+        // pending, otherwise the buffer, which is safe to read while the GPU
+        // may only be reading it too. Pending writes by other GPU work can't
+        // be predicted.
+        MakeRangeValid(run_start_bytes, run_length_bytes, false);
+        for (uint32_t run_page = page; run_page < run_end; ++run_page) {
+          uint32_t run_page_bytes = run_page << page_size_log2();
+          const uint8_t* run_page_gpu_data = nullptr;
+          if (page_gpu_write_submissions_[run_page] <= submission_completed) {
+            run_page_gpu_data = page_copy_submissions_[run_page] > submission_completed
+                                    ? page_copy_sources_[run_page]
+                                    : direct_upload_mapping_ + run_page_bytes;
+          }
+          if (run_page_gpu_data &&
+              !std::memcmp(run_page_gpu_data, memory().TranslatePhysical(run_page_bytes),
+                           size_t(1) << page_size_log2())) {
+            ++direct_upload_stats_pages_unchanged_;
+          } else {
+            append_copy_pages(run_page, 1);
+          }
+        }
+      }
+      page = run_end;
+    }
+  }
+}
+
+bool VulkanSharedMemory::UploadRangesWithCopy(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
     return true;
@@ -323,6 +529,16 @@ bool VulkanSharedMemory::UploadRanges(
       upload_region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
       upload_region.size = upload_buffer_size;
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+      if (direct_upload_mapping_) {
+        // The copy writes these pages in the current submission, from data
+        // that stays in the upload buffer until the submission is completed.
+        for (uint32_t i = 0; i < upload_buffer_pages; ++i) {
+          uint32_t upload_page = upload_range_start + i;
+          page_gpu_use_submissions_[upload_page] = submission_current;
+          page_copy_submissions_[upload_page] = submission_current;
+          page_copy_sources_[upload_page] = upload_buffer_mapping + (size_t(i) << page_size_log2());
+        }
+      }
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
     }

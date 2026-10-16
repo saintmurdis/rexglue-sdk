@@ -140,6 +140,13 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+  // Called at the end of every RequestRanges with the requested byte ranges
+  // (sorted and merged), whether or not they needed uploading, so the
+  // implementation can track which pages the GPU may access in the current
+  // submission. Called after UploadRanges, so during the upload the previous
+  // accesses are still visible.
+  virtual void RangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& /*ranges*/) {}
+
  private:
   memory::Memory& memory_;
 
