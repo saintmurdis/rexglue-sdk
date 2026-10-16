@@ -345,10 +345,12 @@ bool build_mtmsrd(BuilderContext& ctx) {
 
 bool build_mtfsf(BuilderContext& ctx) {
   uint32_t fm = ctx.insn.operands[0];
+  // FM bit 0x80 selects FPSCR field 0 (the top nibble) and bit 0x01 selects field 7 (the low
+  // nibble, which holds RN), so bit k of FM maps to nibble k.
   uint32_t mask = 0;
-  for (int j = 0; j < 8; j++) {
-    if (fm & (1 << (7 - j)))
-      mask |= 0xF << (4 * j);
+  for (int k = 0; k < 8; k++) {
+    if (fm & (1u << k))
+      mask |= 0xFu << (4 * k);
   }
   if (mask == 0xFFFFFFFF) {
     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
