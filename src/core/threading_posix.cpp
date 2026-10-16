@@ -362,13 +362,40 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     auto& ms = GetMultiWaitState();
+    // Terminate() uses pthread_cancel. On macOS a cancel acted on inside
+    // ms.cv.wait_for exits holding ms.mutex and runs no C++ destructors, which
+    // would wedge every later NotifyAll in the process. So cancellation stays
+    // disabled in this loop and is only honoured at its top, where no handle
+    // mutex and no ms.mutex is held. Terminate's own NotifyAll wakes the wait,
+    // so the exit is prompt (at most the 20 ms cap below otherwise).
+    int prev_cancel_state = PTHREAD_CANCEL_DISABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &prev_cancel_state);
+    struct CancelStateRestore {
+      int state;
+      ~CancelStateRestore() { pthread_setcancelstate(state, nullptr); }
+    } cancel_restore{prev_cancel_state};  // declared first, so destroyed last
     struct WaiterGuard {
       std::atomic<int>& n;
+      bool counted = true;
       explicit WaiterGuard(std::atomic<int>& n_) : n(n_) { n.fetch_add(1, std::memory_order_seq_cst); }
-      ~WaiterGuard() { n.fetch_sub(1, std::memory_order_seq_cst); }
+      ~WaiterGuard() {
+        if (counted) n.fetch_sub(1, std::memory_order_seq_cst);
+      }
     } waiter_guard(ms.waiters);
 
     while (true) {
+      if (prev_cancel_state == PTHREAD_CANCEL_ENABLE) {
+        // Not counted as a waiter while a cancel may be acted on, since on
+        // macOS the guard's destructor won't run if this thread exits here.
+        waiter_guard.counted = false;
+        ms.waiters.fetch_sub(1, std::memory_order_seq_cst);
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
+        pthread_testcancel();
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, nullptr);
+        ms.waiters.fetch_add(1, std::memory_order_seq_cst);
+        waiter_guard.counted = true;
+      }
+      // Read after re-registering as a waiter, so no NotifyAll is missed.
       const uint64_t seen_epoch = ms.epoch.load(std::memory_order_seq_cst);
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
