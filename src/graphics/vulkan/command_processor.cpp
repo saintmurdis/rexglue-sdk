@@ -22,8 +22,10 @@
 #include <vector>
 
 #include <SPIRV/GlslangToSpv.h>
+#include <fmt/format.h>
 #include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -71,6 +73,12 @@ REXCVAR_DEFINE_INT32(renderdoc_capture_swap, 0, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_frame_counters, false, "GPU/Vulkan",
+                    "Debug: every 2 seconds, log per guest frame averages of render passes (why "
+                    "they were begun and ended, render area loaded and stored), shared memory "
+                    "uploads, texture loads, resolves, submissions, GPU waits and pipeline "
+                    "creations")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
@@ -2276,6 +2284,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  UpdateFrameCounters();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2609,7 +2618,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                     gamma_ramp_read_stage_mask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
-            SubmitBarriers(true);
+            SubmitBarriers(true, RenderPassReason::kSwap);
             VkBufferCopy gamma_ramp_buffer_copy;
             gamma_ramp_buffer_copy.srcOffset = gamma_ramp_upload_offset;
             gamma_ramp_buffer_copy.dstOffset = gamma_ramp_offset_in_frame;
@@ -2667,7 +2676,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                    swap_fxaa_source_access_mask_, VK_ACCESS_SHADER_WRITE_BIT,
                                    swap_fxaa_source_layout_, VK_IMAGE_LAYOUT_GENERAL);
           }
-          SubmitBarriers(true);
+          SubmitBarriers(true, RenderPassReason::kSwap);
 
           if (use_fxaa) {
             swap_fxaa_source_stage_mask_ = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -2730,7 +2739,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                                    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            SubmitBarriers(true);
+            SubmitBarriers(true, RenderPassReason::kSwap);
             swap_fxaa_source_stage_mask_ = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             swap_fxaa_source_access_mask_ = VK_ACCESS_SHADER_READ_BIT;
             swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2881,7 +2890,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
           // End the current render pass before inserting barriers and starting
           // a new one, and insert the barrier.
-          SubmitBarriers(true);
+          SubmitBarriers(true, RenderPassReason::kSwap);
 
           SwapFramebuffer& swap_framebuffer = swap_framebuffers_[swap_framebuffer_index];
           swap_framebuffer.last_submission = GetCurrentSubmission();
@@ -2899,6 +2908,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           render_pass_begin_info.pClearValues = nullptr;
           deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                         VK_SUBPASS_CONTENTS_INLINE);
+          if (frame_counters_enabled_) {
+            // kGuestOutputFormat is 32bpp, not loaded.
+            CountRenderPassBegin(RenderPassReason::kSwap, render_pass_begin_info.renderArea.extent,
+                                 4, false);
+          }
 
           VkViewport viewport;
           viewport.x = 0.0f;
@@ -3093,16 +3107,17 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   return true;
 }
 
-bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass,
+                                            RenderPassReason end_reason) {
   assert_true(submission_open_);
   SplitPendingBarrier();
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
-      EndRenderPass();
+      EndRenderPass(end_reason);
     }
     return false;
   }
-  EndRenderPass();
+  EndRenderPass(end_reason);
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3132,7 +3147,10 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
-  SubmitBarriers(false);
+  // For gpu_frame_counters, barriers ending the render pass that would have
+  // been continued are counted separately from switching the framebuffer.
+  SubmitBarriers(false, current_framebuffer_ == framebuffer ? RenderPassReason::kBarrier
+                                                            : RenderPassReason::kGuestDraw);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
       REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
@@ -3155,10 +3173,20 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
+    if (frame_counters_enabled_) {
+      ++frame_counters_.render_passes_ended[size_t(RenderPassReason::kGuestDraw)];
+    }
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+
+  if (frame_counters_enabled_) {
+    CountRenderPassBegin(RenderPassReason::kGuestDraw, framebuffer->host_extent,
+                         render_target_cache_->GetRenderPassBytesPerPixel(
+                             render_target_cache_->last_update_render_pass_key()),
+                         true);
+  }
 
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
@@ -3205,8 +3233,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
-    VkImageView transfer_dest_view, bool transfer_dest_is_depth) {
-  SubmitBarriers(false);
+    VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, RenderPassReason reason) {
+  SubmitBarriers(false, current_framebuffer_ == framebuffer ? RenderPassReason::kBarrier : reason);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
       REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
@@ -3229,10 +3258,18 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
     in_render_pass_ = false;
+    if (frame_counters_enabled_) {
+      ++frame_counters_.render_passes_ended[size_t(reason)];
+    }
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+
+  if (frame_counters_enabled_) {
+    CountRenderPassBegin(reason, framebuffer->host_extent,
+                         render_target_cache_->GetRenderPassBytesPerPixel(render_pass_key), true);
+  }
 
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachment = {};
@@ -3295,7 +3332,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
 }
 
-void VulkanCommandProcessor::EndRenderPass() {
+void VulkanCommandProcessor::EndRenderPass(RenderPassReason reason) {
   assert_true(submission_open_);
   if (!in_render_pass_) {
     return;
@@ -3308,6 +3345,102 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+  if (frame_counters_enabled_) {
+    ++frame_counters_.render_passes_ended[size_t(reason)];
+  }
+}
+
+void VulkanCommandProcessor::UpdateFrameCounters() {
+  if (!REXCVAR_GET(gpu_frame_counters)) {
+    frame_counters_enabled_ = false;
+    return;
+  }
+  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  if (!frame_counters_enabled_) {
+    // Just enabled, start counting from this frame.
+    frame_counters_enabled_ = true;
+    frame_counters_ = {};
+    frame_counters_pipelines_created_.store(0, std::memory_order_relaxed);
+    frame_counters_window_start_ = now;
+    return;
+  }
+  ++frame_counters_.frames;
+  uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  uint64_t window_ticks = now - frame_counters_window_start_;
+  if (window_ticks < 2 * tick_frequency) {
+    return;
+  }
+
+  static constexpr const char* kRenderPassReasonNames[] = {
+      "other",  "guest",   "transfer", "clear",    "barrier", "resolve",
+      "upload", "texload", "query",    "readback", "submit",  "swap",
+  };
+  static_assert(rex::countof(kRenderPassReasonNames) == size_t(RenderPassReason::kCount));
+  const FrameCounters& counters = frame_counters_;
+  double frames_inv = 1.0 / double(counters.frames);
+  double ticks_to_ms_per_frame = 1000.0 / double(tick_frequency) * frames_inv;
+  // Only the non-zero reasons, as " name=count".
+  auto format_reasons = [&](const uint64_t* counts, uint64_t& total_out) {
+    std::string reasons;
+    total_out = 0;
+    for (size_t i = 0; i < size_t(RenderPassReason::kCount); ++i) {
+      total_out += counts[i];
+      if (counts[i]) {
+        reasons += fmt::format(" {}={:.1f}", kRenderPassReasonNames[i],
+                               double(counts[i]) * frames_inv);
+      }
+    }
+    return reasons;
+  };
+  uint64_t render_passes_begun, render_passes_ended;
+  std::string render_passes_begun_reasons =
+      format_reasons(counters.render_passes_begun, render_passes_begun);
+  std::string render_passes_ended_reasons =
+      format_reasons(counters.render_passes_ended, render_passes_ended);
+  uint64_t texture_loads_initial = counters.texture_loads - counters.texture_loads_outdated_by_cpu -
+                                   counters.texture_loads_outdated_by_gpu;
+  REXGPU_INFO(
+      "GPU frame counters: {} frames in {:.2f} s, per frame: draws={:.1f} | passes begun={:.1f}{} "
+      "| ended={:.1f}{} | area MB load={:.1f} store={:.1f} | uploads={:.1f} ranges={:.1f} "
+      "MB={:.2f} | texture loads={:.1f} partial={:.1f} Mtexels={:.2f} initial={:.1f} cpu={:.1f} "
+      "gpu={:.1f} | "
+      "resolves copy={:.1f} clear={:.1f} | queries={:.1f} | submits={:.1f} pb_end={:.1f} | "
+      "waits earlier={:.2f} earlier_ms={:.2f} all={:.2f} all_ms={:.2f} | pipelines={:.2f}",
+      counters.frames, double(window_ticks) / double(tick_frequency),
+      double(counters.draws) * frames_inv, double(render_passes_begun) * frames_inv,
+      render_passes_begun_reasons, double(render_passes_ended) * frames_inv,
+      render_passes_ended_reasons, double(counters.render_area_bytes_loaded) / 1.0e6 * frames_inv,
+      double(counters.render_area_bytes_stored) / 1.0e6 * frames_inv,
+      double(counters.uploads) * frames_inv, double(counters.upload_ranges) * frames_inv,
+      double(counters.upload_bytes) / 1.0e6 * frames_inv,
+      double(counters.texture_loads) * frames_inv,
+      double(counters.texture_loads_partial) * frames_inv,
+      double(counters.texture_load_base_texels) / 1.0e6 * frames_inv,
+      double(texture_loads_initial) * frames_inv,
+      double(counters.texture_loads_outdated_by_cpu) * frames_inv,
+      double(counters.texture_loads_outdated_by_gpu) * frames_inv,
+      double(counters.resolve_copies) * frames_inv, double(counters.resolve_clears) * frames_inv,
+      double(counters.occlusion_queries) * frames_inv, double(counters.submissions) * frames_inv,
+      double(counters.submissions_primary_buffer_end) * frames_inv,
+      double(counters.gpu_waits_earlier) * frames_inv,
+      double(counters.gpu_wait_ticks_earlier) * ticks_to_ms_per_frame,
+      double(counters.gpu_waits_all) * frames_inv,
+      double(counters.gpu_wait_ticks_all) * ticks_to_ms_per_frame,
+      double(frame_counters_pipelines_created_.exchange(0, std::memory_order_relaxed)) *
+          frames_inv);
+  frame_counters_ = {};
+  frame_counters_window_start_ = now;
+}
+
+void VulkanCommandProcessor::CountRenderPassBegin(RenderPassReason reason,
+                                                  const VkExtent2D& extent,
+                                                  uint32_t bytes_per_pixel, bool loads) {
+  ++frame_counters_.render_passes_begun[size_t(reason)];
+  uint64_t area_bytes = uint64_t(extent.width) * extent.height * bytes_per_pixel;
+  if (loads) {
+    frame_counters_.render_area_bytes_loaded += area_bytes;
+  }
+  frame_counters_.render_area_bytes_stored += area_bytes;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -3620,6 +3753,9 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
+    if (frame_counters_enabled_) {
+      ++frame_counters_.submissions_primary_buffer_end;
+    }
     EndSubmission(false);
   }
 }
@@ -4119,7 +4255,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
 
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-      SubmitBarriers(true);
+      SubmitBarriers(true, RenderPassReason::kUpload);
 
       VkBufferCopy guest_dma_index_copy_region = {};
       guest_dma_index_copy_region.srcOffset = primitive_processing_result.guest_index_base;
@@ -4161,6 +4297,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  if (frame_counters_enabled_) {
+    ++frame_counters_.draws;
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -4253,7 +4392,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-  SubmitBarriers(true);
+  SubmitBarriers(true, RenderPassReason::kReadback);
 
   uint32_t readback_offset = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -4378,7 +4517,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-  SubmitBarriers(true);
+  SubmitBarriers(true, RenderPassReason::kReadback);
 
   uint32_t readback_offset = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -4626,7 +4765,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
 
     texture_cache_->UseScaledResolveBufferForRead();
-    SubmitBarriers(true);
+    SubmitBarriers(true, RenderPassReason::kReadback);
 
     VkBufferMemoryBarrier pre_barrier = {};
     pre_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -4682,7 +4821,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                              readback.buffers[write_index], 1, &readback_region);
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-    SubmitBarriers(true);
+    SubmitBarriers(true, RenderPassReason::kReadback);
 
     VkBufferCopy readback_region = {};
     readback_region.srcOffset = written_address;
@@ -4896,7 +5035,7 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
     return false;
   }
 
-  EndRenderPass();
+  EndRenderPass(RenderPassReason::kOcclusionQuery);
 
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   command_buffer.CmdVkResetQueryPool(occlusion_query_pool_, host_index, 1);
@@ -4920,8 +5059,11 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   if (!BeginSubmission(true)) {
     return false;
   }
+  if (frame_counters_enabled_) {
+    ++frame_counters_.occlusion_queries;
+  }
 
-  EndRenderPass();
+  EndRenderPass(RenderPassReason::kOcclusionQuery);
 
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   command_buffer.CmdVkEndQuery(occlusion_query_pool_, host_index);
@@ -4996,7 +5138,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     return;
   }
 
-  if (await_submission >= GetCurrentSubmission()) {
+  bool awaiting_all = await_submission >= GetCurrentSubmission();
+  if (awaiting_all) {
     if (submission_open_) {
       EndSubmission(false);
     }
@@ -5017,9 +5160,21 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    uint64_t wait_start_ticks =
+        frame_counters_enabled_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    if (frame_counters_enabled_) {
+      uint64_t wait_ticks = rex::chrono::Clock::QueryHostTickCount() - wait_start_ticks;
+      if (awaiting_all) {
+        ++frame_counters_.gpu_waits_all;
+        frame_counters_.gpu_wait_ticks_all += wait_ticks;
+      } else {
+        ++frame_counters_.gpu_waits_earlier;
+        frame_counters_.gpu_wait_ticks_earlier += wait_ticks;
+      }
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5355,7 +5510,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       active_occlusion_query_ = {};
     }
 
-    EndRenderPass();
+    EndRenderPass(RenderPassReason::kSubmission);
 
     pipeline_cache_->EndSubmission();
 
@@ -5415,7 +5570,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_memory_binds_.clear();
     }
 
-    SubmitBarriers(true);
+    SubmitBarriers(true, RenderPassReason::kSubmission);
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
@@ -5489,6 +5644,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     fences_free_.pop_back();
 
     submission_open_ = false;
+    if (frame_counters_enabled_) {
+      ++frame_counters_.submissions;
+    }
   }
 
   if (is_closing_frame) {

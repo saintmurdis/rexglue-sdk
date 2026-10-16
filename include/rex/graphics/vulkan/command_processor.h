@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -168,6 +169,73 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
+  // Debug statistics (gpu_frame_counters). What a render pass managed by the
+  // command processor is begun for, or what ends it.
+  enum class RenderPassReason : uint32_t {
+    kOther,
+    // Begun for a guest draw, or ended by switching to another guest
+    // framebuffer.
+    kGuestDraw,
+    // EDRAM ownership transfer (including host depth storing for it).
+    kTransfer,
+    kResolveClear,
+    // Ended only by pending barriers - the same framebuffer is needed after
+    // them.
+    kBarrier,
+    // Render target dump and resolve copy.
+    kResolve,
+    // Shared memory upload or another buffer copy.
+    kUpload,
+    kTextureLoad,
+    kOcclusionQuery,
+    kReadback,
+    kSubmission,
+    kSwap,
+
+    kCount,
+  };
+  // Modified only on the command processor thread while gpu_frame_counters is
+  // enabled, reset every time they're logged.
+  struct FrameCounters {
+    uint64_t frames;
+    uint64_t draws;
+    uint64_t render_passes_begun[size_t(RenderPassReason::kCount)];
+    uint64_t render_passes_ended[size_t(RenderPassReason::kCount)];
+    // Whole render area of every attachment of every render pass begun.
+    uint64_t render_area_bytes_loaded;
+    uint64_t render_area_bytes_stored;
+    uint64_t uploads;
+    uint64_t upload_ranges;
+    uint64_t upload_bytes;
+    uint64_t texture_loads;
+    // Only some of the base array slices or 3D depth slices reloaded.
+    uint64_t texture_loads_partial;
+    // Base texels (re)loaded, including resolution scaling, like in the
+    // Direct3D 12 texture load log.
+    uint64_t texture_load_base_texels;
+    // Others are initial loads.
+    uint64_t texture_loads_outdated_by_cpu;
+    uint64_t texture_loads_outdated_by_gpu;
+    uint64_t resolve_copies;
+    uint64_t resolve_clears;
+    // Every one ends a submission and awaits all queue operations.
+    uint64_t occlusion_queries;
+    uint64_t submissions;
+    uint64_t submissions_primary_buffer_end;
+    // Blocking fence waits - for an earlier submission (frame latency, sampler
+    // overflow) or for all queue operations.
+    uint64_t gpu_waits_earlier;
+    uint64_t gpu_wait_ticks_earlier;
+    uint64_t gpu_waits_all;
+    uint64_t gpu_wait_ticks_all;
+  };
+  // nullptr if gpu_frame_counters is disabled.
+  FrameCounters* frame_counters() { return frame_counters_enabled_ ? &frame_counters_ : nullptr; }
+  // May be called from any thread.
+  void CountPipelineCreation() {
+    frame_counters_pipelines_created_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
   // bottom of pipe should be specified only if explicitly needed). Returning
@@ -188,21 +256,25 @@ class VulkanCommandProcessor : public CommandProcessor {
                               uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                               bool skip_if_equal = true);
   // Returns whether any barriers have been submitted - if true is returned, the
-  // render pass will also be closed.
-  bool SubmitBarriers(bool force_end_render_pass);
+  // render pass will also be closed. end_reason is only for
+  // gpu_frame_counters.
+  bool SubmitBarriers(bool force_end_render_pass,
+                      RenderPassReason end_reason = RenderPassReason::kOther);
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer);
-  // Overload for transfer operations with dynamic rendering.
+  // Overload for transfer operations with dynamic rendering. render_pass_key
+  // and reason (kTransfer or kResolveClear) are only for gpu_frame_counters.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
-      VkImageView transfer_dest_view, bool transfer_dest_is_depth);
+      VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, RenderPassReason reason);
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
-  // scope. Submission must be open.
-  void EndRenderPass();
+  // scope. Submission must be open. reason is only for gpu_frame_counters.
+  void EndRenderPass(RenderPassReason reason = RenderPassReason::kOther);
 
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
@@ -424,6 +496,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
 
+  // Called once per guest frame - applies gpu_frame_counters changes, and logs
+  // and resets the counters every 2 seconds.
+  void UpdateFrameCounters();
+  // gpu_frame_counters must be enabled. bytes_per_pixel is for all the
+  // attachments and their samples.
+  void CountRenderPassBegin(RenderPassReason reason, const VkExtent2D& extent,
+                            uint32_t bytes_per_pixel, bool loads);
+
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
@@ -511,6 +591,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool device_lost_ = false;
 
   bool cache_clear_requested_ = false;
+
+  // gpu_frame_counters, updated in the beginning of IssueSwap.
+  bool frame_counters_enabled_ = false;
+  FrameCounters frame_counters_ = {};
+  std::atomic<uint64_t> frame_counters_pipelines_created_{0};
+  uint64_t frame_counters_window_start_ = 0;
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index

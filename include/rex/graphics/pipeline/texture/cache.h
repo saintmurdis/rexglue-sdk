@@ -228,7 +228,21 @@ class TextureCache {
     }
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
-    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+                       bool by_gpu);
+
+    // For debug statistics, what has made the base or the mips outdated since
+    // the last load (the watches fire once until the next load; if both fired,
+    // the later one) - kCreation if never outdated since the texture was
+    // created.
+    enum class OutdatedBy : uint8_t {
+      kCreation,
+      kCpu,
+      kGpu,
+    };
+    OutdatedBy outdated_by(const std::unique_lock<std::recursive_mutex>& global_lock) const {
+      return outdated_by_;
+    }
 
     // Partial base reloads for 2D array textures without mips: guest code often
     // resolves into one slice per frame, and reloading every slice each time is
@@ -282,6 +296,7 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
+    OutdatedBy outdated_by_ = OutdatedBy::kCreation;
     std::atomic<uint32_t> outdated_mask_{0};
     // Within the global critical region, see NoteBaseWrite.
     bool base_partial_valid_ = false;

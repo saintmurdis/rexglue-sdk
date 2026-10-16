@@ -1408,6 +1408,27 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
     }
   }
+  if (VulkanCommandProcessor::FrameCounters* frame_counters = command_processor_.frame_counters()) {
+    ++frame_counters->texture_loads;
+    if (load_base) {
+      frame_counters->texture_load_base_texels +=
+          uint64_t(width) * height * (is_3d ? base_z_count : base_slice_count) *
+          texture_resolution_scale_x * texture_resolution_scale_y;
+      if (base_slice_count < array_size || base_z_count < depth) {
+        ++frame_counters->texture_loads_partial;
+      }
+    }
+    Texture::OutdatedBy outdated_by;
+    {
+      auto lock = rex::thread::global_critical_region::AcquireDirect();
+      outdated_by = vulkan_texture.outdated_by(lock);
+    }
+    if (outdated_by == Texture::OutdatedBy::kCpu) {
+      ++frame_counters->texture_loads_outdated_by_cpu;
+    } else if (outdated_by == Texture::OutdatedBy::kGpu) {
+      ++frame_counters->texture_loads_outdated_by_gpu;
+    }
+  }
   // Bytes of one depth slice of the base in the host buffer.
   VkDeviceSize host_base_z_slice_bytes = VkDeviceSize(load_shader_info.bytes_per_host_block) *
                                          host_layout_base.x_pitch_blocks *
@@ -1674,7 +1695,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
       }
-      command_processor_.SubmitBarriers(true);
+      command_processor_.SubmitBarriers(true,
+                                        VulkanCommandProcessor::RenderPassReason::kTextureLoad);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
@@ -1774,7 +1796,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                             sizeof(load_constants_float_convert.host_offset),
                                             &load_constants_float_convert.host_offset);
         }
-        command_processor_.SubmitBarriers(true);
+        command_processor_.SubmitBarriers(true,
+                                          VulkanCommandProcessor::RenderPassReason::kTextureLoad);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
@@ -1806,7 +1829,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, VulkanCommandProcessor::RenderPassReason::kTextureLoad);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       level_last - level_first + 1);

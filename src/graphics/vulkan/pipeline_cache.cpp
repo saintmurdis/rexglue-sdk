@@ -59,6 +59,8 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, gpu_frame_counters);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -3501,6 +3503,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
         uint32_t(use_dynamic_rendering));
     return false;
+  }
+  if (REXCVAR_GET(gpu_frame_counters)) {
+    command_processor_.CountPipelineCreation();
   }
   bool was_placeholder =
       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);

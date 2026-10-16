@@ -1285,8 +1285,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
-          command_processor_.SubmitBarriers(true);
+          command_processor_.SubmitBarriers(true,
+                                            VulkanCommandProcessor::RenderPassReason::kResolve);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+          if (VulkanCommandProcessor::FrameCounters* frame_counters =
+                  command_processor_.frame_counters()) {
+            ++frame_counters->resolve_copies;
+          }
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -1324,6 +1329,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
               resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
                                            &clear_rectangle);
+          if (VulkanCommandProcessor::FrameCounters* frame_counters =
+                  command_processor_.frame_counters()) {
+            ++frame_counters->resolve_clears;
+          }
         }
         cleared = true;
       } break;
@@ -1347,7 +1356,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_buffer.CmdVkPushConstants(resolve_fsi_clear_pipeline_layout_,
                                             VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                             sizeof(depth_clear_constants), &depth_clear_constants);
-          command_processor_.SubmitBarriers(true);
+          command_processor_.SubmitBarriers(
+              true, VulkanCommandProcessor::RenderPassReason::kResolveClear);
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
         }
         if (clear_color) {
@@ -1367,7 +1377,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(color_clear_constants), &color_clear_constants);
           }
-          command_processor_.SubmitBarriers(true);
+          command_processor_.SubmitBarriers(
+              true, VulkanCommandProcessor::RenderPassReason::kResolveClear);
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
         }
         MarkEdramBufferModified();
@@ -1768,6 +1779,44 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
       assert_unhandled_case(format);
       return VK_FORMAT_UNDEFINED;
   }
+}
+
+uint32_t VulkanRenderTargetCache::GetRenderPassBytesPerPixel(RenderPassKey key) const {
+  uint32_t bytes_per_sample = 0;
+  if (key.depth_and_color_used & 0b1) {
+    // D32_SFLOAT_S8_UINT has 5 bytes of data.
+    bytes_per_sample +=
+        GetDepthVulkanFormat(key.depth_format) == VK_FORMAT_D24_UNORM_S8_UINT ? 4 : 5;
+  }
+  xenos::ColorRenderTargetFormat color_formats[] = {
+      key.color_0_view_format,
+      key.color_1_view_format,
+      key.color_2_view_format,
+      key.color_3_view_format,
+  };
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!(key.depth_and_color_used & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
+    // Ownership transfer formats are the same size as the draw formats.
+    switch (GetColorVulkanFormat(color_formats[i])) {
+      case VK_FORMAT_R16G16B16A16_UNORM:
+      case VK_FORMAT_R16G16B16A16_SNORM:
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+      case VK_FORMAT_R32G32_SFLOAT:
+        bytes_per_sample += 8;
+        break;
+      default:
+        bytes_per_sample += 4;
+        break;
+    }
+  }
+  uint32_t samples = uint32_t(1) << uint32_t(key.msaa_samples);
+  if (key.msaa_samples == xenos::MsaaSamples::k2X &&
+      !IsMsaa2xSupported(key.depth_and_color_used != 0)) {
+    samples = 4;
+  }
+  return bytes_per_sample * samples;
 }
 
 VkFormat VulkanRenderTargetCache::GetColorOwnershipTransferVulkanFormat(
@@ -4671,7 +4720,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             host_depth_store_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
-        command_processor_.SubmitBarriers(true);
+        command_processor_.SubmitBarriers(true,
+                                          VulkanCommandProcessor::RenderPassReason::kTransfer);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
         MarkEdramBufferModified();
       }
@@ -5002,7 +5052,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       // Perform the transfers for the render target.
 
       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-          transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+          transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth,
+          transfer_render_pass_key, VulkanCommandProcessor::RenderPassReason::kTransfer);
 
       if (stencil_clear_rectangle_count) {
         VkClearAttachment* stencil_clear_attachment;
@@ -5315,7 +5366,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     // Perform the clear.
     if (resolve_clear_needed) {
       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-          transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+          transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth,
+          transfer_render_pass_key, VulkanCommandProcessor::RenderPassReason::kResolveClear);
       VkClearAttachment resolve_clear_attachment;
       resolve_clear_attachment.colorAttachment = 0;
       std::memset(&resolve_clear_attachment.clearValue, 0,
@@ -6172,7 +6224,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
                                           sizeof(uint32_t) * kDumpPushConstantOffsets,
                                           sizeof(last_offsets), &last_offsets);
       }
-      command_processor_.SubmitBarriers(true);
+      command_processor_.SubmitBarriers(true, VulkanCommandProcessor::RenderPassReason::kResolve);
       command_buffer.CmdVkDispatch(
           (draw_resolution_scale_x() *
                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *

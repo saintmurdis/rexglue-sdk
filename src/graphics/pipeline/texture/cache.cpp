@@ -815,7 +815,9 @@ void TextureCache::PartialReloadGlobalWatchCallbackThunk(
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+    bool by_gpu) {
+  outdated_by_ = by_gpu ? OutdatedBy::kGpu : OutdatedBy::kCpu;
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -833,7 +835,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
-  texture.WatchCallback(global_lock, argument != 0);
+  texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 

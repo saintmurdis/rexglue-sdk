@@ -166,6 +166,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat format,
       xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X,
       bool* is_integer_out = nullptr) const;
+  // For gpu_frame_counters - host bytes of one pixel of all the attachments of
+  // a render pass, with all their samples.
+  uint32_t GetRenderPassBytesPerPixel(RenderPassKey key) const;
 
  protected:
   uint32_t GetMaxRenderTargetWidth() const override;

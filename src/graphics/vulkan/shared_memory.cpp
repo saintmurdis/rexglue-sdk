@@ -280,7 +280,14 @@ bool VulkanSharedMemory::UploadRanges(
                      (upload_page_ranges.back().first + upload_page_ranges.back().second -
                       upload_page_ranges.front().first)
                          << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, VulkanCommandProcessor::RenderPassReason::kUpload);
+  if (VulkanCommandProcessor::FrameCounters* frame_counters = command_processor_.frame_counters()) {
+    ++frame_counters->uploads;
+    frame_counters->upload_ranges += upload_page_ranges.size();
+    for (auto upload_range : upload_page_ranges) {
+      frame_counters->upload_bytes += uint64_t(upload_range.second) << page_size_log2();
+    }
+  }
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
