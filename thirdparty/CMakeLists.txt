@@ -216,26 +216,136 @@ if(REXGLUE_USE_VULKAN)
         set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
         set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
 
-        # Local MoltenVK patches, kept here so the submodule pin stays upstream's.
-        # Each one is applied to the submodule's work tree at most once.
-        file(GLOB REXGLUE_MOLTENVK_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/moltenvk/*.patch")
+        # Local MoltenVK patches, kept here so the submodule pin stays upstream's. They are applied
+        # to the submodule's work tree at configure time. A stamp in the submodule's git dir records
+        # the submodule HEAD, the patch set and the patched files' contents. When any of these no
+        # longer match (a patch was added, edited or removed, the pin moved, or the submodule was
+        # reset), the files touched by the old and new patch sets are restored from the submodule's
+        # HEAD and the whole set is applied again. Hand edits to those files are lost: change them
+        # through a patch here. The patches and patched files are configure dependencies, so a
+        # reset submodule re-runs CMake (and gets patched again) instead of building unpatched.
+        find_package(Git REQUIRED)
+        set(mvk_dir "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk")
+        file(GLOB REXGLUE_MOLTENVK_PATCHES CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/patches/moltenvk/[0-9]*.patch")
         list(SORT REXGLUE_MOLTENVK_PATCHES)
+
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" rev-parse --absolute-git-dir HEAD
+            WORKING_DIRECTORY "${mvk_dir}"
+            OUTPUT_VARIABLE mvk_rev OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE mvk_rc)
+        if(NOT mvk_rc EQUAL 0)
+            message(FATAL_ERROR "MoltenVK: ${mvk_dir} is not a git work tree")
+        endif()
+        string(REPLACE "\n" ";" mvk_rev "${mvk_rev}")
+        list(GET mvk_rev 0 mvk_git_dir)
+        list(GET mvk_rev 1 mvk_head)
+        set(mvk_stamp "${mvk_git_dir}/rexglue-patches.cmake")
+
+        set(mvk_patch_ids "")
+        set(mvk_files "")
         foreach(patch IN LISTS REXGLUE_MOLTENVK_PATCHES)
+            file(SHA256 "${patch}" patch_id)
+            list(APPEND mvk_patch_ids "${patch_id}")
             execute_process(
-                COMMAND git apply --reverse --check "${patch}"
-                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk"
-                RESULT_VARIABLE already_applied OUTPUT_QUIET ERROR_QUIET)
-            if(NOT already_applied EQUAL 0)
+                COMMAND "${GIT_EXECUTABLE}" apply --numstat "${patch}"
+                WORKING_DIRECTORY "${mvk_dir}"
+                OUTPUT_VARIABLE numstat RESULT_VARIABLE mvk_rc)
+            if(NOT mvk_rc EQUAL 0)
+                message(FATAL_ERROR "MoltenVK: can't read patch ${patch}")
+            endif()
+            string(REGEX MATCHALL "[^\n]+" numstat_lines "${numstat}")
+            foreach(line IN LISTS numstat_lines)
+                string(REGEX REPLACE "^[-0-9]+\t[-0-9]+\t" "" path "${line}")
+                list(APPEND mvk_files "${path}")
+            endforeach()
+        endforeach()
+        list(REMOVE_DUPLICATES mvk_files)
+
+        set(mvk_up_to_date FALSE)
+        set(REXGLUE_MVK_STAMP_FILES "")
+        if(EXISTS "${mvk_stamp}")
+            include("${mvk_stamp}")
+            if(REXGLUE_MVK_STAMP_HEAD STREQUAL mvk_head
+               AND "${REXGLUE_MVK_STAMP_PATCHES}" STREQUAL "${mvk_patch_ids}")
+                set(mvk_up_to_date TRUE)
+                foreach(path hash IN ZIP_LISTS REXGLUE_MVK_STAMP_FILES REXGLUE_MVK_STAMP_HASHES)
+                    if(hash STREQUAL "deleted")
+                        if(EXISTS "${mvk_dir}/${path}")
+                            set(mvk_up_to_date FALSE)
+                            break()
+                        endif()
+                        continue()
+                    endif()
+                    if(NOT EXISTS "${mvk_dir}/${path}")
+                        set(mvk_up_to_date FALSE)
+                        break()
+                    endif()
+                    file(SHA256 "${mvk_dir}/${path}" current)
+                    if(NOT current STREQUAL hash)
+                        set(mvk_up_to_date FALSE)
+                        break()
+                    endif()
+                endforeach()
+            endif()
+        endif()
+
+        if(NOT mvk_up_to_date)
+            set(mvk_restore ${mvk_files} ${REXGLUE_MVK_STAMP_FILES})
+            list(REMOVE_DUPLICATES mvk_restore)
+            foreach(path IN LISTS mvk_restore)
                 execute_process(
-                    COMMAND git apply "${patch}"
-                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk"
-                    RESULT_VARIABLE apply_result)
-                if(NOT apply_result EQUAL 0)
-                    message(FATAL_ERROR "Could not apply MoltenVK patch ${patch}")
+                    COMMAND "${GIT_EXECUTABLE}" cat-file -e "HEAD:${path}"
+                    WORKING_DIRECTORY "${mvk_dir}"
+                    RESULT_VARIABLE in_head OUTPUT_QUIET ERROR_QUIET)
+                if(in_head EQUAL 0)
+                    execute_process(
+                        COMMAND "${GIT_EXECUTABLE}" checkout HEAD -- "${path}"
+                        WORKING_DIRECTORY "${mvk_dir}"
+                        RESULT_VARIABLE mvk_rc)
+                    if(NOT mvk_rc EQUAL 0)
+                        message(FATAL_ERROR "MoltenVK: could not restore ${path}")
+                    endif()
+                else()
+                    # Created by a patch, not part of upstream.
+                    file(REMOVE "${mvk_dir}/${path}")
+                endif()
+            endforeach()
+            foreach(patch IN LISTS REXGLUE_MOLTENVK_PATCHES)
+                execute_process(
+                    COMMAND "${GIT_EXECUTABLE}" apply "${patch}"
+                    WORKING_DIRECTORY "${mvk_dir}"
+                    RESULT_VARIABLE mvk_rc)
+                if(NOT mvk_rc EQUAL 0)
+                    message(FATAL_ERROR "Could not apply MoltenVK patch ${patch} to upstream "
+                        "MoltenVK ${mvk_head}. Update the patch for this MoltenVK version.")
                 endif()
                 message(STATUS "MoltenVK: applied ${patch}")
-            endif()
+            endforeach()
+            set(mvk_hashes "")
+            foreach(path IN LISTS mvk_files)
+                if(EXISTS "${mvk_dir}/${path}")
+                    file(SHA256 "${mvk_dir}/${path}" hash)
+                else()
+                    set(hash "deleted")
+                endif()
+                list(APPEND mvk_hashes "${hash}")
+            endforeach()
+            file(WRITE "${mvk_stamp}"
+                "set(REXGLUE_MVK_STAMP_HEAD \"${mvk_head}\")\n"
+                "set(REXGLUE_MVK_STAMP_PATCHES \"${mvk_patch_ids}\")\n"
+                "set(REXGLUE_MVK_STAMP_FILES \"${mvk_files}\")\n"
+                "set(REXGLUE_MVK_STAMP_HASHES \"${mvk_hashes}\")\n")
+        else()
+            message(STATUS "MoltenVK: local patches already applied")
+        endif()
+
+        set(mvk_configure_deps ${REXGLUE_MOLTENVK_PATCHES})
+        foreach(path IN LISTS mvk_files)
+            list(APPEND mvk_configure_deps "${mvk_dir}/${path}")
         endforeach()
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mvk_configure_deps})
 
         add_subdirectory(moltenvk)
     endif()
