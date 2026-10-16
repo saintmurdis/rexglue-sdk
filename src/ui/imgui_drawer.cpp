@@ -423,6 +423,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   dialog_loop_next_index_ = SIZE_MAX;
 
   ImGui::Render();
+  mouse_over_ui_last_frame_ = io.WantCaptureMouse;
   ImDrawData* draw_data = ImGui::GetDrawData();
   if (draw_data) {
     RenderDrawLists(draw_data, ui_draw_context);
@@ -454,6 +455,29 @@ void ImGuiDrawer::RequestPaintForInput() {
   if (presenter_ && !dialogs_.empty()) {
     presenter_->RequestUIPaintFromUIThread();
   }
+}
+
+void ImGuiDrawer::RequestPaintForMouseMove() {
+  if (!presenter_ || dialogs_.empty()) {
+    return;
+  }
+  const bool continuous = std::any_of(dialogs_.begin(), dialogs_.end(), [](ImGuiDialog* dialog) {
+    return dialog->WantsContinuousRepaint();
+  });
+  if (!continuous) {
+    // Dialogs that opted out only need a move to update hover highlights:
+    // repaint only over a dialog, at most ~30 times a second (guest frames
+    // repaint anyway), so moving the mouse across the game adds no presents.
+    if (!mouse_over_ui_last_frame_) {
+      return;
+    }
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    if (now - last_motion_paint_ticks_ < frame_time_tick_frequency_ / 30) {
+      return;
+    }
+    last_motion_paint_ticks_ = now;
+  }
+  presenter_->RequestUIPaintFromUIThread();
 }
 
 void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_context) {
@@ -548,7 +572,7 @@ void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
 
 void ImGuiDrawer::OnMouseMove(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
-  RequestPaintForInput();
+  RequestPaintForMouseMove();
 }
 
 void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
