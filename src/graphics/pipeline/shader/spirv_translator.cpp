@@ -21,10 +21,22 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_STRING(spirv_moltenvk_contraction, "none", "GPU/Vulkan",
+                      "On MoltenVK, omit NoContraction from translated float math, so SPIRV-Cross "
+                      "emits plain operations instead of helper function calls and Metal may fuse "
+                      "them. Ignored on other Vulkan drivers.\n"
+                      " none: Keep NoContraction in all shaders (default)\n"
+                      " pixel: Omit it in pixel shaders\n"
+                      " all: Omit it in all shaders, and mark the vertex position invariant")
+    .allowed({"none", "pixel", "all"})
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics {
 
@@ -69,6 +81,26 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
     spirv_version = spv::Spv_1_3;
   } else {
     spirv_version = spv::Spv_1_0;
+  }
+
+  // Read once here, so every translation in a run uses the same setting. The
+  // shader storage only keeps guest ucode and pipeline descriptions, never
+  // translated code, so changing it between runs needs no cache invalidation.
+  is_moltenvk = vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK;
+  const std::string& contraction = REXCVAR_GET(spirv_moltenvk_contraction);
+  if (contraction == "pixel" || contraction == "all") {
+    if (is_moltenvk) {
+      float_contraction_pixel = true;
+      float_contraction_vertex = contraction == "all";
+      REXGPU_INFO("SPIR-V: spirv_moltenvk_contraction={}, NoContraction omitted in {} shaders",
+                  contraction, float_contraction_vertex ? "pixel and vertex" : "pixel");
+    } else {
+      REXGPU_WARN("SPIR-V: spirv_moltenvk_contraction={} ignored, the Vulkan driver isn't MoltenVK",
+                  contraction);
+    }
+  } else if (contraction != "none") {
+    // .allowed() isn't checked for values replayed when a plugin registers.
+    REXGPU_WARN("SPIR-V: unknown spirv_moltenvk_contraction={}, using none", contraction);
   }
 }
 
@@ -175,6 +207,10 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
+  // Guest vertex shaders may also become tessellation evaluation or memexport
+  // compute shaders, all covered by float_contraction_vertex.
+  builder_->SetAllowContraction(is_pixel_shader() ? features_.float_contraction_pixel
+                                                  : features_.float_contraction_vertex);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
@@ -1750,6 +1786,14 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   builder_->addMemberName(type_struct_per_vertex, kOutputPerVertexMemberPosition, "gl_Position");
   builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
                                 spv::DecorationBuiltIn, spv::BuiltInPosition);
+  if (builder_->AllowsContraction()) {
+    // Without NoContraction, the same position math may be fused differently in
+    // different shaders, breaking multipass rendering. SPIRV-Cross only emits
+    // [[position, invariant]] (and MoltenVK only enables preserveInvariance)
+    // for Invariant on the member, not on the block variable below.
+    builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
+                                  spv::DecorationInvariant);
+  }
   if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
     builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_clip_distance_,
                             "gl_ClipDistance");

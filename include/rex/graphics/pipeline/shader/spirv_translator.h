@@ -399,6 +399,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // MoltenVK's SPIRV-Cross turns each NoContraction operation into a call to
+    // a helper function in the MSL. Whether to omit NoContraction in pixel
+    // shaders, and in shaders made from guest vertex shaders, comes from the
+    // spirv_moltenvk_contraction cvar, and only ever on MoltenVK.
+    bool is_moltenvk = false;
+    bool float_contraction_pixel = false;
+    bool float_contraction_vertex = false;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
