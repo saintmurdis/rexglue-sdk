@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
@@ -988,17 +992,32 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   switch (fetch.type) {
     case xenos::FetchConstantType::kTexture:
       break;
-    case xenos::FetchConstantType::kInvalidTexture:
+    case xenos::FetchConstantType::kInvalidTexture: {
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
         break;
       }
-      REXGPU_WARN(
-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "has \"invalid\" type! This is incorrect behavior, but you can try "
-          "bypassing this by launching Xenia with "
-          "--gpu_allow_invalid_fetch_constants=true.",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      // Titles can leave unused slots invalid and re-bind them every draw;
+      // warn once per distinct constant instead of every time.
+      static std::mutex seen_mutex;
+      static std::unordered_set<uint64_t> seen;
+      const uint64_t hash = std::hash<std::string_view>{}(
+          std::string_view(reinterpret_cast<const char*>(&fetch), sizeof(fetch)));
+      bool first;
+      {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        first = seen.size() < 256 && seen.insert(hash).second;
+      }
+      if (first) {
+        REXGPU_WARN(
+            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+            "has \"invalid\" type! This is incorrect behavior, but you can try "
+            "bypassing this by launching with "
+            "--gpu_allow_invalid_fetch_constants=true. (Logged once per constant.)",
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5);
+      }
       return;
+    }
     default:
       REXGPU_WARN(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "

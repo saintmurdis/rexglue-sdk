@@ -169,7 +169,14 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   *handle_out = handle;
   if (XFAILED(result)) {
-    REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
+    // Opening a file that doesn't exist is how titles probe for optional
+    // files, so "not found" goes to the debug log; other failures still warn.
+    if (result == X_STATUS_NO_SUCH_FILE || result == X_STATUS_OBJECT_NAME_NOT_FOUND ||
+        result == X_STATUS(0xC000003AL) /* STATUS_OBJECT_PATH_NOT_FOUND */) {
+      REXKRNL_DEBUG("[NtCreateFile] not found: path='{}' -> {:#x}", target_path, result);
+    } else {
+      REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
+    }
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }

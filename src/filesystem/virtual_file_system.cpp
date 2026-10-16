@@ -120,6 +120,15 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
   });
   if (it == devices_.cend()) {
+    // Paths with no device prefix (e.g. a script loader probing "!\lua\x.lua"
+    // or ".\x.lua") can never resolve; titles do this by design, so keep them
+    // out of the warning log.
+    const bool relative = path.find(':') == std::string_view::npos &&
+                          !(path.size() && (path[0] == '\\' || path[0] == '/'));
+    if (relative) {
+      REXFS_DEBUG("VFS: '{}' -> [no device] (relative path)", path);
+      return nullptr;
+    }
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
