@@ -31,10 +31,12 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
-  // render_pass_begin->pNext of all barriers must be null.
-  void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
-                            VkSubpassContents contents) {
+  // render_pass_begin->pNext of all barriers must be null. Returns the offset of
+  // the command for SetBeginRenderAreaHeight.
+  size_t CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                              VkSubpassContents contents) {
     assert_null(render_pass_begin->pNext);
+    size_t command_offset = command_stream_.size();
     size_t arguments_size = sizeof(ArgsVkBeginRenderPass);
     uint32_t clear_value_count = render_pass_begin->clearValueCount;
     size_t clear_values_offset = 0;
@@ -55,6 +57,7 @@ class DeferredCommandBuffer {
       std::memcpy(args_ptr + clear_values_offset, render_pass_begin->pClearValues,
                   sizeof(VkClearValue) * clear_value_count);
     }
+    return command_offset;
   }
 
   void CmdVkBindDescriptorSets(VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout,
@@ -261,9 +264,15 @@ class DeferredCommandBuffer {
 
   void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
 
-  // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
-  void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+  // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3). Returns the
+  // offset of the command for SetBeginRenderAreaHeight.
+  size_t CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+
+  // Changes the render area height of an already written CmdVkBeginRenderPass
+  // or CmdVkBeginRendering, before Execute. An offset, not a pointer, because
+  // the stream may be reallocated by later commands.
+  void SetBeginRenderAreaHeight(size_t command_offset, uint32_t height);
 
   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(

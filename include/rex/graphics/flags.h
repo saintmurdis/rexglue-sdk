@@ -78,6 +78,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
 REXCVAR_DECLARE(bool, vulkan_submit_on_primary_buffer_end);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
+REXCVAR_DECLARE(bool, vulkan_clamp_render_area);
 REXCVAR_DECLARE(bool, vulkan_async_skip_incomplete_frames);
 REXCVAR_DECLARE(int32_t, vulkan_pipeline_creation_threads);
 REXCVAR_DECLARE(bool, vulkan_tessellation_wireframe);

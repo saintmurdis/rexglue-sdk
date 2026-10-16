@@ -180,6 +180,13 @@ class RenderTargetCache {
   // each.
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // Bottom (exclusive, in guest pixels, not resolution-scaled) of what the draw
+  // with the last successful update may rasterize to, from the same estimate as
+  // the EDRAM ranges. UINT32_MAX if unknown (rasterization with no render
+  // targets bound, where sample counting or pixel shader memexport may still
+  // depend on the whole surface), 0 if rasterization is not done.
+  uint32_t last_update_height_used() const { return last_update_height_used_; }
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
@@ -684,6 +691,8 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+  // See last_update_height_used().
+  uint32_t last_update_height_used_ = UINT32_MAX;
 };
 
 }  // namespace rex::graphics

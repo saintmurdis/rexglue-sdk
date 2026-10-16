@@ -275,6 +275,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open. reason is only for gpu_frame_counters.
   void EndRenderPass(RenderPassReason reason = RenderPassReason::kOther);
+  // Call for everything drawn or cleared in a render target cache render pass,
+  // with the bottom (exclusive, in host pixels) of what it may write, or
+  // UINT32_MAX if unknown. With vulkan_clamp_render_area, the render area of
+  // the pass is cut to the maximum of these when it ends.
+  void ExtendRenderPassMaxY(uint32_t max_y) {
+    if (render_pass_max_y_ < max_y) {
+      render_pass_max_y_ = max_y;
+    }
+  }
 
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
@@ -510,6 +519,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   void SplitPendingBarrier();
+
+  // For vulkan_clamp_render_area, call before ending the current render target
+  // cache render pass.
+  void ClampRenderPassRenderArea();
 
   void DestroyScratchBuffer();
   bool InitializeOcclusionQueryResources();
@@ -880,6 +893,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+  // Begin command of the current render pass in deferred_command_buffer_, and
+  // the bottom of what has been drawn in it (see ExtendRenderPassMaxY).
+  size_t render_pass_begin_command_offset_ = 0;
+  uint32_t render_pass_max_y_ = 0;
+  // vulkan_clamp_render_area statistics, logged every
+  // kRenderAreaClampLogInterval render passes.
+  static constexpr uint32_t kRenderAreaClampLogInterval = 16384;
+  uint32_t render_area_clamp_pass_count_ = 0;
+  uint32_t render_area_clamp_full_pass_count_ = 0;
+  uint64_t render_area_clamp_pixels_full_ = 0;
+  uint64_t render_area_clamp_pixels_kept_ = 0;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is

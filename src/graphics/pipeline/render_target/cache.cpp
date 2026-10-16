@@ -561,6 +561,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       std::memset(last_update_accumulated_render_targets_, 0,
                   sizeof(last_update_accumulated_render_targets_));
     }
+    last_update_height_used_ = is_rasterization_done ? UINT32_MAX : 0;
     return true;
   }
 
@@ -573,6 +574,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                        ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
                        : true,
                    vertex_shader));
+  last_update_height_used_ = height_used;
 
   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
   // treat render targets placed closer to the end of the EDRAM as truncating

@@ -372,9 +372,10 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
   }
 }
 
-void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
+size_t DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
   assert_null(rendering_info->pNext);
 
+  size_t command_offset = command_stream_.size();
   size_t arguments_size =
       rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
   size_t color_attachments_offset = arguments_size;
@@ -410,6 +411,26 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   if (rendering_info->pStencilAttachment) {
     std::memcpy(args_ptr + stencil_attachment_offset, rendering_info->pStencilAttachment,
                 sizeof(VkRenderingAttachmentInfo));
+  }
+  return command_offset;
+}
+
+void DeferredCommandBuffer::SetBeginRenderAreaHeight(size_t command_offset, uint32_t height) {
+  assert_true(command_offset + kCommandHeaderSizeElements <= command_stream_.size());
+  uintmax_t* command = command_stream_.data() + command_offset;
+  const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(command);
+  switch (header.command) {
+    case Command::kVkBeginRenderPass:
+      reinterpret_cast<ArgsVkBeginRenderPass*>(command + kCommandHeaderSizeElements)
+          ->render_area.extent.height = height;
+      break;
+    case Command::kVkBeginRendering:
+      reinterpret_cast<ArgsVkBeginRendering*>(command + kCommandHeaderSizeElements)
+          ->render_area.extent.height = height;
+      break;
+    default:
+      assert_unhandled_case(header.command);
+      break;
   }
 }
 

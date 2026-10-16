@@ -80,6 +80,12 @@ REXCVAR_DEFINE_BOOL(gpu_frame_counters, false, "GPU/Vulkan",
                     "uploads, texture loads, resolves, submissions, GPU waits and pipeline "
                     "creations")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_clamp_render_area, false, "GPU/Vulkan",
+                    "Cut the render area of each render target pass to the rows actually drawn "
+                    "(aligned to 32), so tile-based GPUs load and store fewer tiles. Draws with "
+                    "an unknown extent keep the full area; execute_unclipped_draw_vs_on_cpu "
+                    "narrows more of them")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -3167,6 +3173,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    ClampRenderPassRenderArea();
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -3180,6 +3187,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+  render_pass_max_y_ = 0;
 
   if (frame_counters_enabled_) {
     CountRenderPassBegin(RenderPassReason::kGuestDraw, framebuffer->host_extent,
@@ -3211,7 +3219,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
-    deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    render_pass_begin_command_offset_ =
+        deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3222,11 +3231,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.offset.y = 0;
     // TODO(Triang3l): Actual dirty width / height in the deferred command
     // buffer.
+    // With vulkan_clamp_render_area, the height is cut in
+    // ClampRenderPassRenderArea when the pass ends.
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                  VK_SUBPASS_CONTENTS_INLINE);
+    render_pass_begin_command_offset_ = deferred_command_buffer_.CmdVkBeginRenderPass(
+        &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
 }
@@ -3252,6 +3263,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
+    ClampRenderPassRenderArea();
     if (use_dynamic_rendering) {
       deferred_command_buffer_.CmdVkEndRendering();
     } else {
@@ -3265,6 +3277,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+  render_pass_max_y_ = 0;
 
   if (frame_counters_enabled_) {
     CountRenderPassBegin(reason, framebuffer->host_extent,
@@ -3314,7 +3327,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
-    deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    render_pass_begin_command_offset_ =
+        deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3326,8 +3340,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                  VK_SUBPASS_CONTENTS_INLINE);
+    render_pass_begin_command_offset_ = deferred_command_buffer_.CmdVkBeginRenderPass(
+        &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
 }
@@ -3337,6 +3351,7 @@ void VulkanCommandProcessor::EndRenderPass(RenderPassReason reason) {
   if (!in_render_pass_) {
     return;
   }
+  ClampRenderPassRenderArea();
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {
@@ -3441,6 +3456,44 @@ void VulkanCommandProcessor::CountRenderPassBegin(RenderPassReason reason,
     frame_counters_.render_area_bytes_loaded += area_bytes;
   }
   frame_counters_.render_area_bytes_stored += area_bytes;
+}
+
+void VulkanCommandProcessor::ClampRenderPassRenderArea() {
+  if (!in_render_pass_ || !current_framebuffer_ || !REXCVAR_GET(vulkan_clamp_render_area) ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+    return;
+  }
+  // The pass was begun with the whole framebuffer as the render area, but
+  // host render targets are as tall as an EDRAM addressing period, usually
+  // several times the rows the guest draws. Tile-based GPUs load and store
+  // every tile in the render area, so cut it down to the rows written in the
+  // pass, aligned to 32 rows (whole tiles on Apple GPUs). The attachments are
+  // always loaded and stored, so rows below the render area just keep their
+  // contents, and MoltenVK also clips scissors to the render area.
+  const VkExtent2D& host_extent = current_framebuffer_->host_extent;
+  uint32_t height = host_extent.height;
+  if (render_pass_max_y_ < height) {
+    height = std::min(rex::round_up(render_pass_max_y_, uint32_t(32)), height);
+    deferred_command_buffer_.SetBeginRenderAreaHeight(render_pass_begin_command_offset_, height);
+  } else {
+    ++render_area_clamp_full_pass_count_;
+  }
+  render_area_clamp_pixels_full_ += uint64_t(host_extent.width) * host_extent.height;
+  render_area_clamp_pixels_kept_ += uint64_t(host_extent.width) * height;
+  if (++render_area_clamp_pass_count_ >= kRenderAreaClampLogInterval) {
+    REXGPU_INFO(
+        "vulkan_clamp_render_area: {} render passes ({} kept full) kept {:.1f}% of the full "
+        "render area, {:.1f} of {:.1f} Mpx",
+        render_area_clamp_pass_count_, render_area_clamp_full_pass_count_,
+        100.0 * double(render_area_clamp_pixels_kept_) /
+            double(std::max(render_area_clamp_pixels_full_, uint64_t(1))),
+        double(render_area_clamp_pixels_kept_) * 1e-6,
+        double(render_area_clamp_pixels_full_) * 1e-6);
+    render_area_clamp_pass_count_ = 0;
+    render_area_clamp_full_pass_count_ = 0;
+    render_area_clamp_pixels_full_ = 0;
+    render_area_clamp_pixels_kept_ = 0;
+  }
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -4305,6 +4358,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (frame_counters_enabled_) {
     ++frame_counters_.draws;
   }
+  uint32_t height_used = render_target_cache_->last_update_height_used();
+  uint32_t draw_max_y =
+      height_used != UINT32_MAX ? height_used * draw_resolution_scale_y : UINT32_MAX;
+  if (draw_max_y && dynamic_scissor_.extent.width && dynamic_scissor_.extent.height) {
+    // MoltenVK moves a scissor that is entirely below the render area onto the
+    // last row of the area instead of leaving it empty, which would draw a row
+    // that the guest scissors out, so keep the top row of the scissor inside.
+    draw_max_y = std::max(draw_max_y, uint32_t(dynamic_scissor_.offset.y) + 1);
+  }
+  ExtendRenderPassMaxY(draw_max_y);
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==

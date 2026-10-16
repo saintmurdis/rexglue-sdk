@@ -5083,6 +5083,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                 stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
             stencil_clear_rect_write_ptr->baseArrayLayer = 0;
             stencil_clear_rect_write_ptr->layerCount = 1;
+            command_processor_.ExtendRenderPassMaxY(
+                uint32_t(stencil_clear_rect_write_ptr->rect.offset.y) +
+                stencil_clear_rect_write_ptr->rect.extent.height);
             ++stencil_clear_rect_write_ptr;
           }
         }
@@ -5168,6 +5171,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+            command_processor_.ExtendRenderPassMaxY(
+                (transfer_rectangle.y_pixels + transfer_rectangle.height_pixels) *
+                draw_resolution_scale_y());
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
             float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
@@ -5491,6 +5497,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           } break;
         }
       }
+      command_processor_.ExtendRenderPassMaxY(uint32_t(resolve_clear_rect.rect.offset.y) +
+                                              resolve_clear_rect.rect.extent.height);
       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
     }
   }
