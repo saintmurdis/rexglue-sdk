@@ -56,12 +56,16 @@ bool build_fcfid(BuilderContext& ctx) {
   return true;
 }
 
+// fctid and fctiw round by FPSCR[RN]. __builtin_rint rounds by the host FP mode, which
+// storeFromGuest keeps in step with RN. simde's cvtsd_si64/si32 can't be used: without native
+// SSE2 (arm64) they call round(), which always rounds ties away from zero.
 bool build_fctid(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
-      "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
-      "simde_mm_cvtsd_si64(simde_mm_load_sd(&{1}.f64));",
+      "\t{{ const double rounded = __builtin_rint({1}.f64); "
+      "{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
+      "(rounded >= 9223372036854775808.0) ? LLONG_MAX : "
+      "(rounded < -9223372036854775808.0) ? LLONG_MIN : int64_t(rounded); }}",
       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
   return true;
 }
@@ -79,9 +83,10 @@ bool build_fctidz(BuilderContext& ctx) {
 bool build_fctiw(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
-      "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
-      "simde_mm_cvtsd_si32(simde_mm_load_sd(&{1}.f64));",
+      "\t{{ const double rounded = __builtin_rint({1}.f64); "
+      "{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
+      "(rounded >= double(INT_MAX)) ? INT_MAX : "
+      "(rounded < double(INT_MIN)) ? INT_MIN : int32_t(rounded); }}",
       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
   return true;
 }
