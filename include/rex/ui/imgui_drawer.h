@@ -130,7 +130,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   uint64_t last_frame_time_ticks_;
   // For dialogs that opted out of continuous repaint (RequestPaintForMouseMove).
   bool mouse_over_ui_last_frame_ = false;
-  uint64_t last_motion_paint_ticks_ = 0;
 
   // ImGui's IME hook, called from EndFrame with the frame being ended.
   // ImGuiIO::WantTextInput would be a frame behind.

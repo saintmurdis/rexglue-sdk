@@ -465,17 +465,18 @@ void ImGuiDrawer::RequestPaintForMouseMove() {
     return dialog->WantsContinuousRepaint();
   });
   if (!continuous) {
-    // Dialogs that opted out only need a move to update hover highlights:
-    // repaint only over a dialog, at most ~30 times a second (guest frames
-    // repaint anyway), so moving the mouse across the game adds no presents.
+    // Dialogs that opted out only need a move to update hover highlights.
+    // Every paint, guest frames included, runs Draw and so redraws the hover:
+    // repaint for a move only over a dialog and only when nothing has drawn
+    // for 50 ms (longer than a 30 FPS frame), so while the game presents,
+    // moving the mouse adds no presents at all.
     if (!mouse_over_ui_last_frame_) {
       return;
     }
     const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-    if (now - last_motion_paint_ticks_ < frame_time_tick_frequency_ / 30) {
+    if (double(now - last_frame_time_ticks_) < frame_time_tick_frequency_ / 20) {
       return;
     }
-    last_motion_paint_ticks_ = now;
   }
   presenter_->RequestUIPaintFromUIThread();
 }
