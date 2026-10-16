@@ -39,6 +39,12 @@ class ImGuiDialog {
 
   void Draw();
 
+  // While any dialog that wants it exists, the drawer repaints nonstop (at
+  // the display rate with vsync, unbounded without). A dialog returning false
+  // is redrawn only with each presented guest frame and on input, which adds
+  // no presents of its own.
+  virtual bool WantsContinuousRepaint() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

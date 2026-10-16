@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
@@ -437,11 +438,21 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   DetachIfLastDialogRemoved();
 
   if (!dialogs_.empty()) {
-    // Repaint (and handle input) continuously if still active. In detached mode
+    // Repaint (and handle input) continuously if still active, unless every
+    // dialog opted out (then guest frames and input repaint). In detached mode
     // there is no presenter; the app drives repaint via its own present loop.
-    if (presenter_) {
+    const bool continuous = std::any_of(dialogs_.begin(), dialogs_.end(), [](ImGuiDialog* dialog) {
+      return dialog->WantsContinuousRepaint();
+    });
+    if (presenter_ && continuous) {
       presenter_->RequestUIPaintFromUIThread();
     }
+  }
+}
+
+void ImGuiDrawer::RequestPaintForInput() {
+  if (presenter_ && !dialogs_.empty()) {
+    presenter_->RequestUIPaintFromUIThread();
   }
 }
 
@@ -503,6 +514,7 @@ void ImGuiDrawer::OnKeyChar(KeyEvent& e) {
     io.AddInputCharacter(character);
     e.set_handled(true);
   }
+  RequestPaintForInput();
 }
 
 void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
@@ -531,10 +543,12 @@ void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
       io.MouseDown[button] = true;
     }
   }
+  RequestPaintForInput();
 }
 
 void ImGuiDrawer::OnMouseMove(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
+  RequestPaintForInput();
 }
 
 void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
@@ -563,15 +577,18 @@ void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
       }
     }
   }
+  RequestPaintForInput();
 }
 
 void ImGuiDrawer::OnMouseWheel(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
   io.MouseWheel += float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent);
+  RequestPaintForInput();
 }
 
 void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
+  RequestPaintForInput();
   auto& io = GetIO();
   TouchEvent::Action action = e.action();
   uint32_t pointer_id = e.pointer_id();
@@ -616,6 +633,7 @@ void ImGuiDrawer::ClearInput() {
 }
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
+  RequestPaintForInput();
   auto& io = GetIO();
   const VirtualKey virtual_key = e.virtual_key();
   if (auto imGuiKey = VirtualKeyToImGuiKey(virtual_key); imGuiKey) {
