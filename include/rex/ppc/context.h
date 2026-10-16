@@ -147,7 +147,13 @@ constexpr uint32_t kRoundMask = 0x03;
 struct FPSCRRegister {
   uint32_t csr;
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+  // Indexed by FPCR.RMode: RN, RP (toward +inf), RM (toward -inf), RZ.
+  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundUp, kRoundDown, kRoundTowardZero};
+#else
+  // Indexed by MXCSR.RC: nearest, down, up, toward zero.
   static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};
+#endif
 
   using Platform = platform::FPSCRPlatform;
   static constexpr size_t RoundShift = Platform::RoundShift;
