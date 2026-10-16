@@ -445,6 +445,12 @@ void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
 void RegisterLogLevelCallback() {
   rex::cvar::RegisterChangeCallback("log_level", [](std::string_view, std::string_view value) {
     if (auto level = ParseLogLevel(std::string(value))) {
+      {
+        // Loggers registered later (GPU plugin, kernel, audio...) take the
+        // default level, so a change before they exist must reach them too.
+        std::lock_guard lock(g_mutex);
+        g_config.default_level = *level;
+      }
       for (size_t i = 0; i < g_registry.size(); ++i) {
         auto& entry = g_registry[i];
         if (!entry.parent.has_value() && entry.logger && !entry.has_explicit_level)
