@@ -1,0 +1,47 @@
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 406f4f8..0558125 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -22,6 +22,8 @@
+ #include "FileSupport.h"
+ #include "SPIRVSupport.h"
+ #include <fstream>
++#include <string_view>
++#include <cstdlib>
+ 
+ using namespace mvk;
+ using namespace std;
+@@ -339,6 +341,33 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 		}
+ 		conversionResult.msl = pMSLCompiler->compile();
+ 
++		// rexglue: SPIRV-Cross marks its NoContraction arithmetic helpers
++		// [[clang::optnone]], and Apple's compiler then keeps every guarded add,
++		// subtract and multiply as a real function call. Let it inline them.
++		// Only these six helpers; the others that use optnone need it.
++		// Set REX_MVK_KEEP_OPTNONE=1 to keep SPIRV-Cross's output unchanged.
++		if (!getenv("REX_MVK_KEEP_OPTNONE")) {
++			static const char* const kInlinable[] = {
++				"T spvFAdd(", "T spvFSub(", "T spvFMul(",
++				"spvFMulVectorMatrix(", "spvFMulMatrixVector(", "spvFMulMatrixMatrix(",
++			};
++			static const string kOptnone = "[[clang::optnone]] ";
++			string& msl = conversionResult.msl;
++			for (size_t pos = 0; (pos = msl.find(kOptnone, pos)) != string::npos;) {
++				size_t eol = msl.find('\n', pos);
++				string_view line(msl.data() + pos, (eol == string::npos ? msl.size() : eol) - pos);
++				bool strip = false;
++				for (const char* name : kInlinable) {
++					if (line.find(name) != string_view::npos) { strip = true; break; }
++				}
++				if (strip) {
++					msl.erase(pos, kOptnone.size());
++				} else {
++					pos += kOptnone.size();
++				}
++			}
++		}
++
+         if (shouldLogMSL) { logSource(conversionResult.resultLog, conversionResult.msl, "MSL", "Converted"); }
+ 
+ #ifndef SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS

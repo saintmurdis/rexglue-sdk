@@ -215,6 +215,28 @@ if(REXGLUE_USE_VULKAN)
 
         set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
         set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
+
+        # Local MoltenVK patches, kept here so the submodule pin stays upstream's.
+        # Each one is applied to the submodule's work tree at most once.
+        file(GLOB REXGLUE_MOLTENVK_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/moltenvk/*.patch")
+        list(SORT REXGLUE_MOLTENVK_PATCHES)
+        foreach(patch IN LISTS REXGLUE_MOLTENVK_PATCHES)
+            execute_process(
+                COMMAND git apply --reverse --check "${patch}"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk"
+                RESULT_VARIABLE already_applied OUTPUT_QUIET ERROR_QUIET)
+            if(NOT already_applied EQUAL 0)
+                execute_process(
+                    COMMAND git apply "${patch}"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk"
+                    RESULT_VARIABLE apply_result)
+                if(NOT apply_result EQUAL 0)
+                    message(FATAL_ERROR "Could not apply MoltenVK patch ${patch}")
+                endif()
+                message(STATUS "MoltenVK: applied ${patch}")
+            endif()
+        endforeach()
+
         add_subdirectory(moltenvk)
     endif()
 endif()
