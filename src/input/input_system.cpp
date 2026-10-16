@@ -62,6 +62,7 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  std::lock_guard<std::mutex> lock(mutex_);
   // device_owners_ holds raw driver pointers.
   devices_.clear();
   device_owners_.clear();
@@ -69,6 +70,7 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  std::lock_guard<std::mutex> lock(mutex_);
   drivers_.push_back(std::move(driver));
 }
 
@@ -86,6 +88,7 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
 }
 
 void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
+  std::lock_guard<std::mutex> lock(mutex_);
   assignment_ = std::move(assignment);
   if (assignment_) {
     assignment_->OnDevicesChanged(devices_);
@@ -219,6 +222,7 @@ DeviceId InputSystem::ChooseDeviceForUser(uint32_t user_index) const {
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -244,10 +248,9 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
   }
 
   // Titles poll capabilities off this rather than every frame, so without it
-  // a pad plugged in mid-game is never noticed.
-  if (auto* kernel_state = REX_KERNEL_STATE()) {
-    kernel_state->BroadcastNotification(kXNotificationSystemInputDevicesChanged, 0);
-  }
+  // a pad plugged in mid-game is never noticed. Sent by
+  // FlushDeviceNotification once mutex_ is released.
+  device_notification_pending_.store(true);
 
   if (!connected) {
     user_max_joystick_value_[user_index] = {};
@@ -280,20 +283,44 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     return X_ERROR_SUCCESS;
   }
 
-  X_RESULT result = GetStateForUI(user_index, out_state);
+  X_RESULT result;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    result = GetStateForUILocked(user_index, out_state);
 
-  if (result == X_ERROR_SUCCESS && out_state && user_index < kMaxGuestUsers &&
-      consumed_buttons_[user_index] != 0) {
-    const uint16_t buttons = out_state->gamepad.buttons;
-    // Each button leaves the mask once the player lets go of it.
-    consumed_buttons_[user_index] &= buttons;
-    out_state->gamepad.buttons = static_cast<uint16_t>(buttons & ~consumed_buttons_[user_index]);
+    if (result == X_ERROR_SUCCESS && out_state && user_index < kMaxGuestUsers &&
+        consumed_buttons_[user_index] != 0) {
+      const uint16_t buttons = out_state->gamepad.buttons;
+      // Each button leaves the mask once the player lets go of it.
+      consumed_buttons_[user_index] &= buttons;
+      out_state->gamepad.buttons = static_cast<uint16_t>(buttons & ~consumed_buttons_[user_index]);
+    }
   }
+  FlushDeviceNotification();
 
   return result;
 }
 
 X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state) {
+  X_RESULT result;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    result = GetStateForUILocked(user_index, out_state);
+  }
+  FlushDeviceNotification();
+  return result;
+}
+
+void InputSystem::FlushDeviceNotification() {
+  if (!device_notification_pending_.exchange(false)) {
+    return;
+  }
+  if (auto* kernel_state = REX_KERNEL_STATE()) {
+    kernel_state->BroadcastNotification(kXNotificationSystemInputDevicesChanged, 0);
+  }
+}
+
+X_RESULT InputSystem::GetStateForUILocked(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -345,12 +372,16 @@ void InputSystem::AddUIInputBlocker() {
 void InputSystem::RemoveUIInputBlocker() {
   // Whatever is held right now stays masked until released, so the press that
   // dismissed the dialog is not also read as a press in the game.
-  X_INPUT_STATE state = {};
-  for (uint32_t user_index = 0; user_index < kMaxGuestUsers; user_index++) {
-    if (GetStateForUI(user_index, &state) == X_ERROR_SUCCESS) {
-      consumed_buttons_[user_index] |= static_cast<uint16_t>(state.gamepad.buttons);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    X_INPUT_STATE state = {};
+    for (uint32_t user_index = 0; user_index < kMaxGuestUsers; user_index++) {
+      if (GetStateForUILocked(user_index, &state) == X_ERROR_SUCCESS) {
+        consumed_buttons_[user_index] |= static_cast<uint16_t>(state.gamepad.buttons);
+      }
     }
   }
+  FlushDeviceNotification();
 
   ui_input_blockers_.fetch_sub(1);
 }
@@ -363,8 +394,9 @@ void InputSystem::ToggleVibration() {
   REXCVAR_SET(vibration, !REXCVAR_GET(vibration));
   // The guest's next SetState may never come while a motor is running.
   X_INPUT_VIBRATION silence = {};
+  std::lock_guard<std::mutex> lock(mutex_);
   for (uint32_t user_index = 0; user_index < kMaxGuestUsers; user_index++) {
-    SetState(user_index, &silence);
+    SetStateLocked(user_index, &silence);
   }
 }
 
@@ -416,6 +448,11 @@ X_INPUT_VIBRATION InputSystem::ModifyVibrationLevel(const X_INPUT_VIBRATION* vib
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return SetStateLocked(user_index, vibration);
+}
+
+X_RESULT InputSystem::SetStateLocked(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_ || !vibration) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -462,6 +499,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

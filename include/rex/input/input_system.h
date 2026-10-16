@@ -14,6 +14,7 @@
 #include <atomic>
 #include <bitset>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -62,9 +63,15 @@ class InputSystem : public system::IInputSystem {
   bool GetVibrationEnabled() const;
   void ToggleVibration();
 
-  std::bitset<kMaxGuestUsers> GetConnectedUsers() const { return connected_users_; }
+  std::bitset<kMaxGuestUsers> GetConnectedUsers() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connected_users_;
+  }
   /// Guest user whose device most recently produced a button press.
-  uint32_t GetLastUsedUser() const { return last_used_user_; }
+  uint32_t GetLastUsedUser() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_used_user_;
+  }
 
  private:
   using JoystickValue = std::pair<uint16_t, uint16_t>;
@@ -77,11 +84,26 @@ class InputSystem : public system::IInputSystem {
   /// the player's hands.
   DeviceId ChooseDeviceForUser(uint32_t user_index) const;
 
+  // The *Locked variants expect mutex_ to be held.
+  X_RESULT GetStateForUILocked(uint32_t user_index, X_INPUT_STATE* out_state);
+  X_RESULT SetStateLocked(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+  /// Sends the devices-changed notification queued by UpdateConnectedUser.
+  /// Call with mutex_ released: the broadcast takes the global critical
+  /// region, which must not be acquired after mutex_.
+  void FlushDeviceNotification();
+
   void UpdateConnectedUser(uint32_t user_index, bool connected);
   void AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gamepad) const;
   X_INPUT_VIBRATION ModifyVibrationLevel(const X_INPUT_VIBRATION* vibration) const;
 
   rex::ui::Window* window_ = nullptr;
+
+  // Guest threads poll input concurrently, and every entry point rebuilds
+  // devices_ via RefreshDevices(); this serializes them and guards the
+  // per-user state below. Not held in AttachWindow/SetActiveCallback, whose
+  // driver callbacks run synchronously on the UI thread.
+  mutable std::mutex mutex_;
+  std::atomic<bool> device_notification_pending_{false};
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 
