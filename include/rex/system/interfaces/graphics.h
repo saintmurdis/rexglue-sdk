@@ -79,6 +79,10 @@ class IGraphicsSystem {
     (void)blocking;
   }
 
+  // True while a non-blocking InitializeShaderStorage is still preloading on
+  // the GPU thread (the guest's GPU work waits for it). Any thread.
+  virtual bool IsShaderStorageLoading() const { return false; }
+
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {

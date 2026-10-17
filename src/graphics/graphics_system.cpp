@@ -358,8 +358,10 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
       fence.Wait();
     }
   } else {
+    shader_storage_loading_.store(true, std::memory_order_release);
     command_processor_->CallInThread([this, cache_root, title_id]() {
       command_processor_->InitializeShaderStorage(cache_root, title_id, false);
+      shader_storage_loading_.store(false, std::memory_order_release);
     });
   }
 }

@@ -82,6 +82,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
+  bool IsShaderStorageLoading() const override {
+    return shader_storage_loading_.load(std::memory_order_acquire);
+  }
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -130,6 +133,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic_flag host_gpu_loss_reported_;
+  std::atomic<bool> shader_storage_loading_{false};
 };
 
 }  // namespace rex::graphics
