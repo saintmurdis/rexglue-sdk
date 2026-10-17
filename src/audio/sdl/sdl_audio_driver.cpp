@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -203,8 +205,13 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const float target = (muted || fading) ? 0.0f : gain;
   if (!driver->capture_opened_) {
     driver->capture_opened_ = true;
-    const std::string& path = REXCVAR_GET(audio_capture_file);
+    std::string path = REXCVAR_GET(audio_capture_file);
     if (!path.empty()) {
+      // One file per output: a second or re-created driver gets <path>.2, .3, ...
+      static std::atomic<int> capture_count{0};
+      if (const int n = ++capture_count; n > 1) {
+        path += "." + std::to_string(n);
+      }
       driver->capture_ = std::fopen(path.c_str(), "wb");
       REXAPU_INFO("audio capture to {}: {}", path, driver->capture_ ? "on" : "can't open the file");
     }
