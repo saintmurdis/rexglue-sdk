@@ -29,7 +29,8 @@
 namespace rex::system {
 
 // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
-inline constexpr uint32_t kGpuPluginAbiVersion = 1;
+// 2: IGraphicsSystem::IsShaderStorageLoading.
+inline constexpr uint32_t kGpuPluginAbiVersion = 2;
 
 inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
 inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";

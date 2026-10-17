@@ -79,10 +79,6 @@ class IGraphicsSystem {
     (void)blocking;
   }
 
-  // True while a non-blocking InitializeShaderStorage is still preloading on
-  // the GPU thread (the guest's GPU work waits for it). Any thread.
-  virtual bool IsShaderStorageLoading() const { return false; }
-
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {
@@ -96,6 +92,13 @@ class IGraphicsSystem {
   }
 
   virtual void Shutdown() = 0;
+
+  // New virtuals go here, after the existing ones, with a bump of
+  // kGpuPluginAbiVersion (gpu_plugin.h).
+
+  // True while a non-blocking InitializeShaderStorage is still preloading on
+  // the GPU thread (the guest's GPU work waits for it). Any thread.
+  virtual bool IsShaderStorageLoading() const { return false; }
 };
 
 }  // namespace rex::system
