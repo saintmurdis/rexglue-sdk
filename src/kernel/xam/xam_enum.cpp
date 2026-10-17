@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -22,6 +23,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/platform.h>
 #endif
+
+#include <algorithm>
+#include <cstring>
 
 #include <fmt/format.h>
 
@@ -83,9 +87,39 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
   return result;
 }
 
-u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
-                                    u32 unk7, u32 unk8) {
-  return X_ERROR_INVALID_PARAMETER;
+// The music player's (XMP, app 0xFA) user-playlist enumerator: open message
+// 0x70026, close 0x70027, items of XMP_USER_PLAYLIST_INFO (0x334 bytes). The
+// title then sends 0x70025 with the enumerator's private area and reads the
+// records with XamEnumerate. Every other kind keeps failing as before.
+u32 XamCreateEnumeratorHandle_entry(u32 user_index, u32 app_id, u32 open_message,
+                                    u32 close_message, u32 extra_size, u32 item_count, u32 flags,
+                                    mapped_u32 out_handle) {
+  constexpr uint32_t kXmpAppId = 0xFA;
+  constexpr uint32_t kXmpUserPlaylistEnumerate = 0x70026;
+  if (app_id != kXmpAppId || open_message != kXmpUserPlaylistEnumerate || !out_handle) {
+    REXKRNL_DEBUG("XamCreateEnumeratorHandle(app {:08X}, open {:08X}): unsupported", app_id,
+                  open_message);
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto* xmp = static_cast<apps::XmpApp*>(REX_KERNEL_STATE()->app_manager()->GetApp(kXmpAppId));
+  if (!xmp) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), std::max<uint32_t>(item_count, 1),
+                                                 apps::XmpApp::kUserPlaylistInfoSize);
+  auto result =
+      e->Initialize(user_index, app_id, open_message, close_message, flags, extra_size, nullptr);
+  if (XFAILED(result)) {
+    return result;
+  }
+  const auto records = xmp->UserPlaylistRecords();
+  for (const auto& record : records) {
+    std::memcpy(e->AppendItem(), record.data(), record.size());
+  }
+  REXKRNL_DEBUG("XamCreateEnumeratorHandle: XMP user playlists, {} of {} per call", records.size(),
+                item_count);
+  *out_handle = e->handle();
+  return X_ERROR_SUCCESS;
 }
 
 u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object_ptr) {
