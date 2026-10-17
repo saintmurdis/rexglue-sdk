@@ -124,7 +124,14 @@ std::filesystem::path GetUserFolder() {
 }
 
 FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
-  return fopen(path.c_str(), std::string(mode).c_str());
+  FILE* file = fopen(path.c_str(), std::string(mode).c_str());
+  // "a+": glibc and Windows start reading at the beginning of the file, BSD/macOS
+  // at the end. Callers read a header first (the shader and pipeline storage), so
+  // match glibc. Writes in append mode still always go to the end.
+  if (file && mode.find('a') != std::string_view::npos && mode.find('+') != std::string_view::npos) {
+    rewind(file);
+  }
+  return file;
 }
 
 bool Seek(FILE* file, int64_t offset, int origin) {
