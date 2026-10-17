@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -20,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/system.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/window_sdl.h>
 
@@ -56,6 +58,27 @@ bool SDLWindowedAppContext::Initialize() {
   }
   const char* video_driver_in_use = SDL_GetCurrentVideoDriver();
   REXLOG_INFO("SDL video driver: {}", video_driver_in_use ? video_driver_in_use : "unknown");
+#if !REX_PLATFORM_WIN32
+  // Fatal startup errors as a window (Windows has its own native one in core).
+  // Main thread only: SDL's Cocoa alert must run there, and a worker blocking on
+  // it while the main thread waits for that worker would deadlock.
+  rex::SetSimpleMessageBoxHandler([](rex::SimpleMessageBoxType type, std::string_view message) {
+    if (!SDL_IsMainThread()) {
+      return;
+    }
+    SDL_MessageBoxFlags flags = SDL_MESSAGEBOX_INFORMATION;
+    const char* title = "Information";
+    if (type == rex::SimpleMessageBoxType::Error) {
+      flags = SDL_MESSAGEBOX_ERROR;
+      title = "Error";
+    } else if (type == rex::SimpleMessageBoxType::Warning) {
+      flags = SDL_MESSAGEBOX_WARNING;
+      title = "Warning";
+    }
+    const std::string text(message);
+    SDL_ShowSimpleMessageBox(flags, title, text.c_str(), nullptr);
+  });
+#endif
   uint32_t first = SDL_RegisterEvents(2);
   if (first == 0) {
     REXLOG_ERROR("SDL_RegisterEvents failed: {}", SDL_GetError());

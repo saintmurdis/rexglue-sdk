@@ -37,4 +37,11 @@ enum class SimpleMessageBoxType {
 // This is expected to block the caller until the message box is closed.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
 
+#if !defined(_WIN32)
+// macOS/Linux: ShowSimpleMessageBox writes to stderr and, once the UI layer has
+// installed a handler (SDL), also shows a window; core itself has no UI.
+using SimpleMessageBoxHandler = void (*)(SimpleMessageBoxType type, std::string_view message);
+void SetSimpleMessageBoxHandler(SimpleMessageBoxHandler handler);
+#endif
+
 }  // namespace rex
