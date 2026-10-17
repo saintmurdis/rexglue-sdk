@@ -158,10 +158,31 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  if (system::XThread::IsInThread(worker_thread_.get()) &&
+      !has_pending_fns_.load(std::memory_order_acquire)) {
     fn();
-  } else {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
     pending_fns_.push(std::move(fn));
+    has_pending_fns_.store(true, std::memory_order_release);
+  }
+}
+
+void CommandProcessor::RunPendingFunctions() {
+  while (has_pending_fns_.load(std::memory_order_acquire)) {
+    std::queue<std::function<void()>> fns;
+    {
+      std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+      fns.swap(pending_fns_);
+      has_pending_fns_.store(false, std::memory_order_release);
+    }
+    while (!fns.empty()) {
+      auto fn = std::move(fns.front());
+      fns.pop();
+      fn();
+    }
   }
 }
 
@@ -204,11 +225,7 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      fn();
-    }
+    RunPendingFunctions();
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
@@ -229,10 +246,10 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !has_pending_fns_.load(std::memory_order_acquire) &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || has_pending_fns_.load(std::memory_order_acquire)) {
         continue;
       }
     }

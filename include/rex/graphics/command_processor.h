@@ -139,6 +139,9 @@ class CommandProcessor {
   };
 
   void WorkerThreadMain();
+  // Runs everything queued by CallInThread, on the worker thread.
+  void RunPendingFunctions();
+
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
@@ -238,7 +241,10 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
-  std::queue<std::function<void()>> pending_fns_;
+  // Functions for the worker thread, pushed from any thread (CallInThread).
+  std::mutex pending_fns_mutex_;
+  std::queue<std::function<void()>> pending_fns_;  // guarded by pending_fns_mutex_
+  std::atomic<bool> has_pending_fns_{false};       // set after a push, for the wait loop
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
