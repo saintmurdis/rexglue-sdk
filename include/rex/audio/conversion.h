@@ -21,10 +21,14 @@
 
 namespace rex::audio::conversion {
 
+// Each converter scales by gain and clamps the result to [-clip, clip]. An
+// output stage that applies its own gain afterwards passes infinity and clamps
+// at the end, so a lowered volume still keeps loud passages from clipping.
+
 #if REX_ARCH_AMD64
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const SurroundMix& mix,
-                                                float gain) {
+                                                float gain, float clip = 1.0f) {
   // The gain pass below walks the output four floats at a time, and its weight
   // table assumes 6 channels divide evenly into those windows.
   assert_true(ch_sample_count % 2 == 0);
@@ -59,8 +63,8 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
   const float l = mix.lfe * gain;
   const __m128 w[3] = {_mm_setr_ps(gain, gain, c, l), _mm_setr_ps(s, s, gain, gain),
                        _mm_setr_ps(c, l, s, s)};
-  const __m128 lo = _mm_set1_ps(-1.0f);
-  const __m128 hi = _mm_set1_ps(1.0f);
+  const __m128 lo = _mm_set1_ps(-clip);
+  const __m128 hi = _mm_set1_ps(clip);
   const size_t count = ch_sample_count * 6;
   for (size_t i = 0, phase = 0; i < count; i += 4, phase = (phase + 1) % 3) {
     const __m128 v = _mm_mul_ps(_mm_loadu_ps(&output[i]), w[phase]);
@@ -70,7 +74,7 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
 
 inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const StereoFold& fold,
-                                                float gain) {
+                                                float gain, float clip = 1.0f) {
   assert_true(ch_sample_count % 4 == 0);
 
   const __m128i byte_swap_shuffle =
@@ -79,8 +83,8 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
   const __m128 lfe = _mm_set1_ps(fold.lfe);
   const __m128 surround = _mm_set1_ps(fold.surround);
   const __m128 scale = _mm_set1_ps(fold.scale * gain);
-  const __m128 lo = _mm_set1_ps(-1.0f);
-  const __m128 hi = _mm_set1_ps(1.0f);
+  const __m128 lo = _mm_set1_ps(-clip);
+  const __m128 hi = _mm_set1_ps(clip);
 
   for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
     // load 4 samples from 6 channels each
@@ -112,20 +116,20 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
 #else
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const SurroundMix& mix,
-                                                float gain) {
+                                                float gain, float clip = 1.0f) {
   const float w[6] = {
       gain, gain, mix.center * gain, mix.lfe * gain, mix.surround * gain, mix.surround * gain};
   for (size_t sample = 0; sample < ch_sample_count; sample++) {
     for (size_t channel = 0; channel < 6; channel++) {
       const float v = rex::byte_swap(input[channel * ch_sample_count + sample]) * w[channel];
-      output[sample * 6 + channel] = std::clamp(v, -1.0f, 1.0f);
+      output[sample * 6 + channel] = std::clamp(v, -clip, clip);
     }
   }
 }
 
 inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const StereoFold& fold,
-                                                float gain) {
+                                                float gain, float clip = 1.0f) {
   // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
   // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
   const float scale = fold.scale * gain;
@@ -138,8 +142,8 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
     // Center and LFE land on both sides.
     const float mid = fc * fold.center + lf * fold.lfe;
-    output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);
-    output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -1.0f, 1.0f);
+    output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -clip, clip);
+    output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -clip, clip);
   }
 }
 #endif

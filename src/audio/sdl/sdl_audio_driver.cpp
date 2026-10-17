@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
@@ -222,16 +223,19 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     }
     const int channels = driver->sdl_device_channels_;
     if (buffer && !(muted && !declick)) {
-      // With the envelope the gain is applied per sample below, so volume changes ramp.
+      // With the envelope the gain is applied per sample below, so volume changes
+      // ramp, and the clamp comes after it (clamping first would clip loud
+      // passages that a lowered volume used to bring back under full scale).
       const float frame_gain = declick ? 1.0f : gain;
+      const float clip = declick ? std::numeric_limits<float>::infinity() : 1.0f;
       switch (channels) {
         case 2:
           conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-                                                          frame_gain);
+                                                          frame_gain, clip);
           break;
         case 6:
           conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
-                                                          frame_gain);
+                                                          frame_gain, clip);
           break;
         default:
           assert_unhandled_case(driver->sdl_device_channels_);
@@ -310,6 +314,12 @@ float SDLAudioDriver::ApplyEnvelope(float* data, bool frame, int channels, float
       float v = hold_[c];
       if (frame) {
         v += data[s * channels + c] * env_;
+      }
+      // A NaN or infinity from the guest mix would otherwise stay in the held
+      // sample and silence the channel for the rest of the session.
+      if (!std::isfinite(v)) {
+        v = 0.0f;
+        hold_[c] = 0.0f;
       }
       v = std::clamp(v, -1.0f, 1.0f);
       data[s * channels + c] = v;
