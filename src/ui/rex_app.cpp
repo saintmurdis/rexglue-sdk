@@ -11,6 +11,8 @@
 
 #include <rex/rex_app.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <string>
@@ -28,6 +30,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
+#include <rex/audio/downmix.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
@@ -532,9 +535,22 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  // Fade the audio out while TerminateTitle waits for the game's threads, so the
+  // output ends in silence instead of cutting mid-waveform (a click), at no extra
+  // quit time in the usual case.
+  const auto close_time = std::chrono::steady_clock::now();
+  rex::audio::BeginOutputFadeOut();
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - close_time);
+  const bool faded = rex::audio::WaitOutputFadedOut(
+      std::max(std::chrono::milliseconds(0), std::chrono::milliseconds(300) - elapsed));
+  REXLOG_INFO("Audio {} {} ms after close", faded ? "faded out" : "fade timed out",
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - close_time)
+                  .count());
   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
