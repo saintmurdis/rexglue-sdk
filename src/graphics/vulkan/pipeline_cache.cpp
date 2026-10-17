@@ -416,6 +416,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
+  // Records that passed the integrity check: the file keeps these, including
+  // any this device can't create (the in-memory list drops them), so the
+  // truncation below cuts only corrupted or partial records.
+  size_t pipeline_storage_valid_count = 0;
   // <Shader hash, modification bits>.
   std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
   auto pipeline_storage_file_path =
@@ -491,6 +495,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         }
       }
       pipeline_stored_descriptions.resize(pipeline_storage_kept_count);
+      pipeline_storage_valid_count = pipeline_storage_read_count;
       if (pipeline_storage_skipped_unsupported_count || pipeline_storage_skipped_corrupted_count) {
         REXGPU_INFO(
             "VulkanPipelineCache: Pipeline storage filtering kept {} descriptions (skipped {} "
@@ -694,8 +699,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   rex::filesystem::TruncateStdioFile(
       pipeline_storage_file_,
       uint64_t(sizeof(pipeline_storage_file_header) +
-               sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
-  if (pipeline_stored_descriptions.empty()) {
+               sizeof(PipelineStoredDescription) * pipeline_storage_valid_count));
+  if (!pipeline_storage_valid_count) {
     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
     pipeline_storage_file_header.magic = pipeline_storage_magic;
     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
