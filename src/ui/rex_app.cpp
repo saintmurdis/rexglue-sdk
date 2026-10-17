@@ -56,6 +56,13 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(shader_storage_preload_async, false, "GPU",
+                    "Preload the stored pipelines on the GPU thread instead of making the UI "
+                    "thread wait for them at launch. The guest's GPU work still waits until "
+                    "they are built, but the window stays responsive (a cold Metal shader "
+                    "cache can make this take many seconds)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Graphics backend of the GPU plugin: 'any' (first compiled in: d3d12, "
                       "then vulkan), 'd3d12' or 'vulkan'")
@@ -496,8 +503,10 @@ void ReXApp::LaunchModule() {
     if (graphics_system && !runtime_->cache_root().empty()) {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+        const bool async = REXCVAR_GET(shader_storage_preload_async);
+        REXLOG_INFO("Initializing shader storage for title {:08X}{}...", title_id,
+                    async ? " (on the GPU thread)" : "");
+        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, !async);
       }
     }
 
