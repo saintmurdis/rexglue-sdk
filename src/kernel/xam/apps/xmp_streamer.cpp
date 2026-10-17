@@ -143,56 +143,78 @@ uint64_t XmpStreamer::underrun_blocks() const {
 void XmpStreamer::DecodeThread() {
   std::unique_ptr<XmpSongDecoder> decoder;
   uint64_t decoder_generation = ~uint64_t(0);
-  size_t failures = 0;  // songs in a row that wouldn't open
+  size_t failures = 0;      // songs in a row that wouldn't open or gave no audio
+  bool produced = false;    // the current decoder has given frames
   std::vector<float> chunk(size_t(kChunkFrames) * 2);
+  // Decoders are closed with the lock released: closing a file can block (a
+  // network volume), and the Audio Worker takes the lock every block.
+  auto drop = [&](std::unique_lock<std::mutex>& held) {
+    if (decoder) {
+      auto old = std::move(decoder);
+      held.unlock();
+      old.reset();
+      held.lock();
+    }
+  };
+  // A song that won't open, or opens but gives no audio, is skipped; when no
+  // song in the playlist gives audio, the playlist ends (instead of cycling
+  // through it forever).
+  auto skip = [&](size_t position) {
+    if (++failures >= order_.size()) {
+      boundaries_.emplace_back(write_, kEnd);
+      decode_done_ = true;
+      return;
+    }
+    const size_t next = NextPosition(position);
+    boundaries_.emplace_back(write_, next);
+    decode_position_ = next;
+    decode_done_ = next == kEnd;
+  };
   std::unique_lock<std::mutex> lock(mutex_);
   while (true) {
-    cv_.wait(lock, [this] {
-      return quit_ ||
+    cv_.wait(lock, [&] {
+      return quit_ || (decoder && decoder_generation != generation_) ||
              (active_ && !decode_done_ && kRingFrames - (write_ - read_) >= kChunkFrames);
     });
     if (quit_) {
+      drop(lock);
       return;
+    }
+    if (decoder_generation != generation_) {
+      // Start or Stop: let go of the old song's file right away.
+      drop(lock);
+      decoder_generation = generation_;
+      failures = 0;
+      continue;
     }
     const uint64_t generation = generation_;
     const size_t position = decode_position_;
-    if (decoder_generation != generation) {
-      decoder.reset();
-      decoder_generation = generation;
-      failures = 0;
-    }
     if (!decoder) {
       const size_t song = order_[position];
       Opener opener = opener_;
       lock.unlock();
-      decoder = opener ? opener(song) : nullptr;
+      auto opened = opener ? opener(song) : nullptr;
       lock.lock();
       if (generation != generation_) {
-        decoder.reset();
+        lock.unlock();
+        opened.reset();
+        lock.lock();
         continue;
       }
-      if (decoder) {
-        infos_[position] = decoder->info();
-        failures = 0;
-      } else if (++failures >= order_.size()) {
-        // Nothing in the playlist opens: end it.
-        boundaries_.emplace_back(write_, kEnd);
-        decode_done_ = true;
-        continue;
-      } else {
-        // Skip it: the next song starts where this one would have.
-        const size_t next = NextPosition(position);
-        boundaries_.emplace_back(write_, next);
-        decode_position_ = next;
-        decode_done_ = next == kEnd;
+      if (!opened) {
+        skip(position);
         continue;
       }
+      decoder = std::move(opened);
+      produced = false;
+      infos_[position] = decoder->info();
     }
+    XmpSongDecoder* current = decoder.get();
     lock.unlock();
-    const uint32_t n = decoder->Read(chunk.data(), kChunkFrames);
+    const uint32_t n = current->Read(chunk.data(), kChunkFrames);
     lock.lock();
     if (generation != generation_) {
-      continue;  // a Start or Stop came in while decoding; drop it
+      continue;  // a Start or Stop came in while decoding; drop it (and the decoder, above)
     }
     if (n) {
       for (uint32_t i = 0; i < n; ++i) {
@@ -201,9 +223,21 @@ void XmpStreamer::DecodeThread() {
         ring_[slot + 1] = chunk[i * 2 + 1];
       }
       write_ += n;
+      if (!produced) {
+        produced = true;
+        failures = 0;
+      }
     } else {
       // End of the song.
-      decoder.reset();
+      const bool gave_audio = produced;
+      drop(lock);
+      if (generation != generation_) {
+        continue;
+      }
+      if (!gave_audio) {
+        skip(position);
+        continue;
+      }
       const size_t next = NextPosition(position);
       boundaries_.emplace_back(write_, next);
       decode_position_ = next;
