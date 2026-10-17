@@ -124,7 +124,8 @@ class XmpApp : public system::xam::App {
   bool UserTransport(uint32_t message);
   // Starts the active user playlist at a position in its play order. capture_mutex_ held.
   void StartUserPlayback(size_t position);
-  void LogNowPlaying();
+  // Logs the song playing now; false while its file isn't open yet. capture_mutex_ held.
+  bool LogNowPlaying();
   // Audio Worker, before each title audio frame: one block of capture output.
   void PumpCapture(runtime::FunctionDispatcher* dispatcher, runtime::ThreadState* thread_state);
 

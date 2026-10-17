@@ -429,12 +429,15 @@ void XmpApp::StartUserPlayback(size_t position) {
   log_now_playing_ = true;
 }
 
-void XmpApp::LogNowPlaying() {
+bool XmpApp::LogNowPlaying() {
   size_t position = 0;
   size_t song = 0;
   XmpSongInfo info;
   if (active_user_playlist_ < 0 || !user_->streamer.Current(&position, &song, &info)) {
-    return;
+    return true;
+  }
+  if (info.format.empty()) {
+    return false;  // the decode thread hasn't opened the song yet
   }
   const auto& playlist = user_->library.playlists[active_user_playlist_];
   const std::u16string& title = info.title.empty() ? playlist.songs[song].title : info.title;
@@ -442,8 +445,8 @@ void XmpApp::LogNowPlaying() {
                rex::string::to_utf8(playlist.title), position + 1, user_order_.size(),
                rex::string::to_utf8(title),
                info.artist.empty() ? std::string() : " by " + rex::string::to_utf8(info.artist),
-               info.format.empty() ? "?" : info.format, info.source_rate / 1000.0,
-               MinutesSeconds(info.duration_ms));
+               info.format, info.source_rate / 1000.0, MinutesSeconds(info.duration_ms));
+  return true;
 }
 
 X_HRESULT XmpApp::XMPCaptureOutput(uint32_t buffer_ptr) {
@@ -595,11 +598,11 @@ void XmpApp::PumpCapture(runtime::FunctionDispatcher* dispatcher,
       state_ = State::kIdle;
       notify = true;
     } else if (read.song_changed || log_now_playing_) {
-      // The first block of a song: the title reads the new song's info on the
-      // notification.
-      log_now_playing_ = false;
-      LogNowPlaying();
-      notify = read.song_changed;
+      // A new song: the title reads its info (title, length) on the
+      // notification, so send it once the decode thread has opened the file;
+      // until then the info has only the file name.
+      log_now_playing_ = !LogNowPlaying();
+      notify = read.song_changed || !log_now_playing_;
     }
   }
   if (notify) {
