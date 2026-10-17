@@ -1,3 +1,21 @@
+From: Ashton (github.com/saintmurdis)
+Subject: [PATCH] SPIRVToMSLConverter: let Apple's compiler inline SPIRV-Cross's
+ NoContraction helpers
+
+SPIRV-Cross turns NoContraction float add/sub/mul into helper calls tagged
+[[clang::optnone]] (spvFAdd, spvFSub, spvFMul and three matrix multiplies),
+which Apple's Metal compiler keeps as real calls (SPIRV-Cross #1999, #2156).
+After conversion, strip optnone from just those six helpers. Setting
+REX_MVK_KEEP_OPTNONE=1 in the environment keeps the original output.
+
+This modifies MoltenVK's SPIRVToMSLConverter.cpp, Copyright (c) 2015-2026
+The Brenwill Workshop Ltd., licensed under the Apache License 2.0. Changed by
+Ashton in 2026 for rexglue-sdk; the change is offered under the same licence.
+The approach follows xenia-edge (has207/xenia-edge, by XeniOS).
+
+rexglue-sdk applies this file to the MoltenVK submodule at configure time
+(thirdparty/CMakeLists.txt); git apply skips this header.
+---
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 index 406f4f8..0558125 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
