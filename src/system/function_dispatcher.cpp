@@ -273,6 +273,20 @@ bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
   return true;
 }
 
+size_t FunctionDispatcher::RestoreFunctionTables() {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  memory_->ResetFunctionTables();
+  size_t restored = 0;
+  for (const auto& [guest_address, func] : function_table_) {
+    if (memory_->SetFunction(guest_address, func)) {
+      ++restored;
+    } else {
+      REXLOG_ERROR("RestoreFunctionTables: no table for {:08X}", guest_address);
+    }
+  }
+  return restored;
+}
+
 ::PPCFunc* FunctionDispatcher::GetFunction(uint32_t guest_address) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
   auto it = function_table_.find(guest_address);

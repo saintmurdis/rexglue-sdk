@@ -556,6 +556,12 @@ class Memory {
   // Returns false if guest_address is outside every registered module range.
   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);
   bool HasAnyFunctionTable() const;
+  // Marks every function table's pages allocated again and zeroes the tables.
+  // Loading an XEX resets the image heap's page table, and a title update that
+  // shrinks the image decompresses the base image over the start of the table
+  // (which sits at IMAGE_BASE + the patched IMAGE_SIZE). FunctionDispatcher::
+  // RestoreFunctionTables refills the entries afterwards.
+  void ResetFunctionTables();
 
  private:
 #if REX_PLATFORM_MAC

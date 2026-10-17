@@ -86,6 +86,12 @@ class FunctionDispatcher : public IModuleRegistrar {
   ::PPCFunc* GetFunction(uint32_t guest_address);
   bool HasAnyFunctionTable() const { return !module_tables_.empty(); }
   /**
+   * Rewrites every guest function table from the host-side map after an XEX
+   * load, which may have overwritten or released table pages (see
+   * Memory::ResetFunctionTables). Returns the number of entries written.
+   */
+  size_t RestoreFunctionTables();
+  /**
    * caller_address must be inside a registered module, or 0 to mean "host-
    * initiated, route to the entrypoint pool".
    */

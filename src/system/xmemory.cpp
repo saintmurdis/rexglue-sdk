@@ -864,6 +864,22 @@ bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
   return true;
 }
 
+void Memory::ResetFunctionTables() {
+  std::lock_guard lock(function_tables_mutex_);
+  for (const auto& entry : function_tables_) {
+    uint32_t table_size = (entry.code_size + entry.thunk_reserve) * 2;
+    auto* heap = LookupHeap(entry.table_base);
+    // Commit-only: pages still reserved by the image keep their reservation, free
+    // pages are reserved again. On the host this only restores access.
+    if (!heap || !heap->AllocFixed(entry.table_base, table_size, heap->page_size(),
+                                   memory::kMemoryAllocationCommit,
+                                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+      REXSYS_WARN("ResetFunctionTables: couldn't re-commit the table at {:08X}", entry.table_base);
+    }
+    Zero(entry.table_base, table_size);
+  }
+}
+
 bool Memory::HasAnyFunctionTable() const {
   std::lock_guard lock(function_tables_mutex_);
   return !function_tables_.empty();

@@ -367,6 +367,13 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
     return status;
   }
 
+  // The function table was filled in Setup, before the image existed; the load
+  // can clobber it (title updates that shrink the image) and resets its pages.
+  if (function_dispatcher_->HasAnyFunctionTable()) {
+    size_t restored = function_dispatcher_->RestoreFunctionTables();
+    REXSYS_INFO("Function table restored after loading the XEX: {} entries", restored);
+  }
+
   kernel_state_->SetExecutableModule(module);
   REXSYS_DEBUG("  XEX image loaded successfully");
   return X_STATUS_SUCCESS;
