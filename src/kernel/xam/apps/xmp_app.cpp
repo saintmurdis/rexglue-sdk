@@ -20,6 +20,7 @@
 
 #include <rex/audio/pre_frame_hook.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/xthread.h>
@@ -54,9 +55,9 @@ constexpr size_t kMaxMetadataChars = 40;  // XMP_MAX_METADATA_STRING, NUL includ
 
 // Writes a big-endian UTF-16 string, cut to fit `units` code units with its NUL.
 void StoreString(uint8_t* dst, const std::u16string& text, size_t units = kMaxMetadataChars) {
-  const size_t n = std::min(text.size(), units - 1);
+  const std::u16string cut = TruncateXmpText(text, units - 1);  // never half a surrogate pair
   for (size_t i = 0; i < units; ++i) {
-    memory::store_and_swap<uint16_t>(dst + i * 2, i < n ? uint16_t(text[i]) : uint16_t(0));
+    memory::store_and_swap<uint16_t>(dst + i * 2, i < cut.size() ? uint16_t(cut[i]) : uint16_t(0));
   }
 }
 
@@ -98,6 +99,7 @@ std::string MinutesSeconds(uint32_t ms) {
 }  // namespace
 
 struct XmpApp::UserMusic {
+  std::filesystem::path folder;
   XmpLibrary library;
   XmpStreamer streamer;
 };
@@ -118,6 +120,7 @@ XmpApp::XmpApp(KernelState* kernel_state)
   // Scanned once: titles ask for the playlist count once per session (SSX caches it).
   const std::string folder_setting = REXCVAR_GET(xmp_music_folder);
   const std::filesystem::path folder = ExpandHome(folder_setting);
+  user_->folder = folder;
   user_->library = ScanXmpLibrary(folder);
   if (REXCVAR_GET(xmp_test_tone)) {
     std::vector<std::u16string> taken;
@@ -137,7 +140,7 @@ XmpApp::XmpApp(KernelState* kernel_state)
                  user_->library.skipped
                      ? ", " + std::to_string(user_->library.skipped) + " files not songs"
                      : std::string(),
-                 folder.string(),
+                 rex::path_to_utf8(folder),
                  folder_setting.empty() || std::filesystem::is_directory(folder) ? ""
                                                                                  : ", missing");
     for (const auto& playlist : user_->library.playlists) {
@@ -421,12 +424,36 @@ void XmpApp::StartUserPlayback(size_t position) {
         std::string error;
         auto decoder = OpenXmpSongFile(entry.path, &error);
         if (!decoder) {
-          REXKRNL_WARN("XMP: skipping {}: {}", entry.path.string(), error);
+          REXKRNL_WARN("XMP: skipping {}: {}", rex::path_to_utf8(entry.path), error);
         }
         return decoder;
       },
       user_order_, position, user_repeat_);
   log_now_playing_ = true;
+}
+
+XmpApp::UserLibraryStatus XmpApp::GetUserLibraryStatus() {
+  UserLibraryStatus status;
+  if (!REXCVAR_GET(xmp_music_folder).empty()) {
+    status.folder = rex::path_to_utf8(user_->folder);
+  }
+  for (const auto& playlist : user_->library.playlists) {
+    status.playlists.emplace_back(rex::string::to_utf8(playlist.title), playlist.songs.size());
+  }
+  status.songs = user_->library.songs;
+  status.skipped = user_->library.skipped;
+  std::lock_guard<std::mutex> lock(capture_mutex_);
+  size_t song = 0;
+  XmpSongInfo info;
+  if (active_user_playlist_ >= 0 && user_->streamer.Current(nullptr, &song, &info)) {
+    const auto& playlist = user_->library.playlists[active_user_playlist_];
+    status.playlist = rex::string::to_utf8(playlist.title);
+    status.song = rex::string::to_utf8(info.title.empty() ? playlist.songs[song].title : info.title);
+    if (!info.artist.empty()) {
+      status.song += " - " + rex::string::to_utf8(info.artist);
+    }
+  }
+  return status;
 }
 
 bool XmpApp::LogNowPlaying() {

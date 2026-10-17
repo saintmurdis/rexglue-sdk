@@ -92,6 +92,17 @@ class XmpApp : public system::xam::App {
   // The records XamCreateEnumeratorHandle(0xFA, 0x70026) hands out.
   std::vector<UserPlaylistRecord> UserPlaylistRecords() const;
 
+  // For an app's own UI: what the music folder held at startup and what plays.
+  struct UserLibraryStatus {
+    std::string folder;  // the music folder as scanned; empty when none is set
+    std::vector<std::pair<std::string, size_t>> playlists;  // UTF-8 title, songs
+    size_t songs = 0;
+    size_t skipped = 0;   // files there that aren't songs
+    std::string playlist;  // playing now (UTF-8), empty when nothing plays
+    std::string song;
+  };
+  UserLibraryStatus GetUserLibraryStatus();
+
   X_HRESULT XMPGetStatus(uint32_t status_ptr);
 
   X_HRESULT XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count,
