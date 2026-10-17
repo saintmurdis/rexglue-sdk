@@ -53,10 +53,16 @@ uint8_t* XStaticUntypedEnumerator::AppendItem() {
 }
 
 uint32_t XStaticUntypedEnumerator::WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
-                                              uint32_t* written_count) {
+                                              uint32_t buffer_size, uint32_t* written_count) {
   size_t count = std::min(item_count_ - current_item_, items_per_enumerate());
   if (!count) {
     return X_ERROR_NO_MORE_FILES;
+  }
+  if (buffer_size) {
+    count = std::min<size_t>(count, buffer_size / item_size());
+    if (!count) {
+      return X_ERROR_INSUFFICIENT_BUFFER;
+    }
   }
 
   size_t size = count * item_size();

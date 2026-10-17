@@ -60,7 +60,10 @@ class XEnumerator : public XObject {
     return result;
   }
 
-  virtual uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  // Writes the next items into the guest buffer. buffer_size is its size in
+  // bytes (0: unknown); an enumerator never writes past it and returns
+  // X_ERROR_INSUFFICIENT_BUFFER when not even one item fits.
+  virtual uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t buffer_size,
                               uint32_t* written_count) = 0;
 
   size_t item_size() const { return item_size_; }
@@ -82,7 +85,8 @@ class XStaticUntypedEnumerator : public XEnumerator {
 
   uint8_t* AppendItem();
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override;
+  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t buffer_size,
+                      uint32_t* written_count) override;
 
  private:
   size_t item_count_;
