@@ -581,6 +581,12 @@ void UnregisterChangeCallbacks(std::string_view name) {
 // Initialization
 //=============================================================================
 
+// Options registered after Init (by the GPU plugin, loaded at startup) are
+// accepted on the command line but can't be listed by --help.
+constexpr const char* kHelpFootnote =
+    "\nOptions of the GPU plugin (e.g. vsync, store_shaders, vulkan_*) are not listed\n"
+    "here; they are loaded later and work as --name=value too.\n";
+
 std::vector<std::string> Init(int argc, char** argv) {
   CLI::App app{"", ""};
   app.allow_extras();
@@ -607,9 +613,11 @@ std::vector<std::string> Init(int argc, char** argv) {
     // --help/-h: print the options registered so far and quit, instead of
     // starting the app as if nothing had been asked.
     fputs(app.help().c_str(), stdout);
+    fputs(kHelpFootnote, stdout);
     std::exit(EXIT_SUCCESS);
   } catch (const CLI::CallForAllHelp&) {
     fputs(app.help("", CLI::AppFormatMode::All).c_str(), stdout);
+    fputs(kHelpFootnote, stdout);
     std::exit(EXIT_SUCCESS);
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
