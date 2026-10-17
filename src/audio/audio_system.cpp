@@ -12,6 +12,7 @@
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
+#include <rex/audio/pre_frame_hook.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
@@ -145,6 +146,7 @@ void AudioSystem::WorkerThreadMain() {
                        client_callback, client_callback_arg, index);
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
+        RunPreFrameHook(function_dispatcher_, worker_thread_->thread_state());
         uint64_t args[] = {client_callback_arg};
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));

@@ -50,6 +50,8 @@ class App {
 class AppManager {
  public:
   void RegisterApp(std::unique_ptr<App> app);
+  // The registered app with this ID, or nullptr.
+  App* GetApp(uint32_t app_id) const;
 
   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length);
