@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -601,6 +603,14 @@ std::vector<std::string> Init(int argc, char** argv) {
 
   try {
     app.parse(argc, argv);
+  } catch (const CLI::CallForHelp&) {
+    // --help/-h: print the options registered so far and quit, instead of
+    // starting the app as if nothing had been asked.
+    fputs(app.help().c_str(), stdout);
+    std::exit(EXIT_SUCCESS);
+  } catch (const CLI::CallForAllHelp&) {
+    fputs(app.help("", CLI::AppFormatMode::All).c_str(), stdout);
+    std::exit(EXIT_SUCCESS);
   } catch (const CLI::ParseError& e) {
     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
     //             dont call rex logging funcs here for now.
