@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_decoder_common.cpp
  * @brief       Platform-independent song decoders (test tone) and file types.
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

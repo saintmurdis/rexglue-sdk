@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_decoder_apple.cpp
  * @brief       Song decoding with AudioToolbox's ExtAudioFile (macOS).
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

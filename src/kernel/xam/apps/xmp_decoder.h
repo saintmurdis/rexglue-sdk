@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_decoder.h
  * @brief       Song decoding for the XMP app's user playlists.
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

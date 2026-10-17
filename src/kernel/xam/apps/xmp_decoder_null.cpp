@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_decoder_null.cpp
  * @brief       No song decoder on this platform (user playlists list but stay silent).
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

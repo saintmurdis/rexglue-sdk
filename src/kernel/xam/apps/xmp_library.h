@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_library.h
  * @brief       User playlists from a folder for the XMP app.
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

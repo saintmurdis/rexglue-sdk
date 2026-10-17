@@ -2,7 +2,7 @@
  * @file        kernel/xam/apps/xmp_streamer.h
  * @brief       Decodes a user playlist ahead on its own thread for capture output.
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 

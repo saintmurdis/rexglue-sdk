@@ -2,7 +2,7 @@
  * @file        audio/pre_frame_hook.h
  * @brief       A function the Audio Worker runs before each guest audio frame.
  *
- * @copyright   Copyright (c) 2026 Tom Clay
+ * @copyright   Copyright (c) 2026 Ashton (github.com/saintmurdis)
  * @license     BSD 3-Clause License
  */
 
