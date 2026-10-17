@@ -11,6 +11,7 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -87,8 +88,13 @@ class AppleDecoder final : public XmpSongDecoder {
     if (status != noErr || file_format.mChannelsPerFrame == 0 || file_format.mSampleRate <= 0) {
       return fail("no audio format", status);
     }
-    // Decode to float at 48 kHz; mono stays mono here and is doubled in Read.
-    decoder->channels_ = file_format.mChannelsPerFrame == 1 ? 1 : 2;
+    // Decode to float at 48 kHz in the file's own channels: mono is doubled and
+    // more than two channels are folded to stereo in Read (the converter would
+    // just drop channels 3 and up of PCM and lossless files).
+    decoder->channels_ = std::min<UInt32>(file_format.mChannelsPerFrame, kMaxChannels);
+    if (decoder->channels_ > 2) {
+      decoder->SetupFold();
+    }
     AudioStreamBasicDescription client{};
     client.mSampleRate = kSampleRate;
     client.mFormatID = kAudioFormatLinearPCM;
@@ -118,9 +124,9 @@ class AppleDecoder final : public XmpSongDecoder {
 
   uint32_t Read(float* interleaved, uint32_t frames) override {
     float* target = interleaved;
-    if (channels_ == 1) {
-      mono_.resize(frames);
-      target = mono_.data();
+    if (channels_ != 2) {
+      scratch_.resize(size_t(frames) * channels_);
+      target = scratch_.data();
     }
     AudioBufferList list{};
     list.mNumberBuffers = 1;
@@ -133,8 +139,20 @@ class AppleDecoder final : public XmpSongDecoder {
     }
     if (channels_ == 1) {
       for (UInt32 i = 0; i < read; ++i) {
-        interleaved[i * 2] = mono_[i];
-        interleaved[i * 2 + 1] = mono_[i];
+        interleaved[i * 2] = scratch_[i];
+        interleaved[i * 2 + 1] = scratch_[i];
+      }
+    } else if (channels_ > 2) {
+      for (UInt32 i = 0; i < read; ++i) {
+        float l = 0.0f;
+        float r = 0.0f;
+        for (UInt32 c = 0; c < channels_; ++c) {
+          const float v = scratch_[size_t(i) * channels_ + c];
+          l += v * fold_left_[c];
+          r += v * fold_right_[c];
+        }
+        interleaved[i * 2] = l;
+        interleaved[i * 2 + 1] = r;
       }
     }
     return read;
@@ -180,9 +198,108 @@ class AppleDecoder final : public XmpSongDecoder {
     CFRelease(tags);
   }
 
+  // Stereo fold weights per file channel, by its layout label: fronts in full,
+  // center and surrounds at -3 dB, LFE dropped, all scaled by 0.586 (the SDK's
+  // own 5.1 fold) so a full-scale mix doesn't clip.
+  void SetupFold() {
+    std::vector<AudioChannelLabel> labels(channels_, kAudioChannelLabel_Unknown);
+    UInt32 size = 0;
+    Boolean writable = false;
+    if (ExtAudioFileGetPropertyInfo(file_, kExtAudioFileProperty_FileChannelLayout, &size,
+                                    &writable) == noErr &&
+        size >= sizeof(AudioChannelLayout)) {
+      std::vector<uint8_t> raw(size);
+      auto* layout = reinterpret_cast<AudioChannelLayout*>(raw.data());
+      if (ExtAudioFileGetProperty(file_, kExtAudioFileProperty_FileChannelLayout, &size, layout) ==
+          noErr) {
+        std::vector<uint8_t> expanded;
+        const AudioChannelLayout* use = layout;
+        if (layout->mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions) {
+          const bool bitmap = layout->mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap;
+          const AudioFormatPropertyID property = bitmap ? kAudioFormatProperty_ChannelLayoutForBitmap
+                                                        : kAudioFormatProperty_ChannelLayoutForTag;
+          const void* spec = bitmap ? static_cast<const void*>(&layout->mChannelBitmap)
+                                    : static_cast<const void*>(&layout->mChannelLayoutTag);
+          UInt32 expanded_size = 0;
+          if (AudioFormatGetPropertyInfo(property, sizeof(UInt32), spec, &expanded_size) == noErr &&
+              expanded_size >= sizeof(AudioChannelLayout)) {
+            expanded.resize(expanded_size);
+            if (AudioFormatGetProperty(property, sizeof(UInt32), spec, &expanded_size,
+                                       expanded.data()) == noErr) {
+              use = reinterpret_cast<const AudioChannelLayout*>(expanded.data());
+            }
+          }
+        }
+        if (use->mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelDescriptions) {
+          for (UInt32 i = 0; i < use->mNumberChannelDescriptions && i < channels_; ++i) {
+            labels[i] = use->mChannelDescriptions[i].mChannelLabel;
+          }
+        }
+      }
+    }
+    bool known = false;
+    for (AudioChannelLabel label : labels) {
+      known |= label != kAudioChannelLabel_Unknown && label != kAudioChannelLabel_Unused;
+    }
+    if (!known) {
+      // No layout: the WAV order, L R C LFE Ls Rs.
+      static constexpr AudioChannelLabel kWave[] = {
+          kAudioChannelLabel_Left,      kAudioChannelLabel_Right,        kAudioChannelLabel_Center,
+          kAudioChannelLabel_LFEScreen, kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround};
+      for (UInt32 i = 0; i < channels_ && i < 6; ++i) {
+        labels[i] = kWave[i];
+      }
+    }
+    constexpr float kScale = 0.586f;
+    constexpr float kSide = 0.7071f;
+    fold_left_.assign(channels_, 0.0f);
+    fold_right_.assign(channels_, 0.0f);
+    for (UInt32 c = 0; c < channels_; ++c) {
+      float l = 0.0f;
+      float r = 0.0f;
+      switch (labels[c]) {
+        case kAudioChannelLabel_Left:
+        case kAudioChannelLabel_LeftWide:
+        case kAudioChannelLabel_LeftCenter:
+          l = 1.0f;
+          break;
+        case kAudioChannelLabel_Right:
+        case kAudioChannelLabel_RightWide:
+        case kAudioChannelLabel_RightCenter:
+          r = 1.0f;
+          break;
+        case kAudioChannelLabel_Center:
+        case kAudioChannelLabel_CenterSurround:
+          l = r = kSide;
+          break;
+        case kAudioChannelLabel_LeftSurround:
+        case kAudioChannelLabel_LeftSurroundDirect:
+        case kAudioChannelLabel_RearSurroundLeft:
+          l = kSide;
+          break;
+        case kAudioChannelLabel_RightSurround:
+        case kAudioChannelLabel_RightSurroundDirect:
+        case kAudioChannelLabel_RearSurroundRight:
+          r = kSide;
+          break;
+        case kAudioChannelLabel_LFEScreen:
+        case kAudioChannelLabel_LFE2:
+          break;
+        default:
+          l = r = 0.5f;  // anything else: centered, a little lower
+          break;
+      }
+      fold_left_[c] = l * kScale;
+      fold_right_[c] = r * kScale;
+    }
+  }
+
+  static constexpr UInt32 kMaxChannels = 8;
   ExtAudioFileRef file_ = nullptr;
   UInt32 channels_ = 2;
-  std::vector<float> mono_;
+  std::vector<float> scratch_;
+  std::vector<float> fold_left_;
+  std::vector<float> fold_right_;
 };
 
 }  // namespace
