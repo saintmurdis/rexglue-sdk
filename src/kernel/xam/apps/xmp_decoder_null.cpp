@@ -10,6 +10,8 @@
 
 namespace rex::kernel::xam::apps {
 
+std::u16string NormalizeXmpName(const std::u16string& name) { return name; }
+
 std::unique_ptr<XmpSongDecoder> OpenXmpSongFile(const std::filesystem::path&, std::string* error) {
   if (error) {
     *error = "no song decoder on this platform";

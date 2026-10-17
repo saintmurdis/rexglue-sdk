@@ -187,6 +187,18 @@ class AppleDecoder final : public XmpSongDecoder {
 
 }  // namespace
 
+std::u16string NormalizeXmpName(const std::u16string& name) {
+  CFMutableStringRef text = CFStringCreateMutable(kCFAllocatorDefault, 0);
+  if (!text) {
+    return name;
+  }
+  CFStringAppendCharacters(text, reinterpret_cast<const UniChar*>(name.data()), CFIndex(name.size()));
+  CFStringNormalize(text, kCFStringNormalizationFormC);
+  std::u16string out = ToU16(text);
+  CFRelease(text);
+  return out;
+}
+
 std::unique_ptr<XmpSongDecoder> OpenXmpSongFile(const std::filesystem::path& path,
                                                 std::string* error) {
   return AppleDecoder::Open(path, error);

@@ -45,6 +45,15 @@ class XmpSongDecoder {
 // Whether the file name has an extension the platform decoder may handle.
 bool IsXmpSongFile(const std::filesystem::path& path);
 
+// A name taken from the file system, in the form titles expect: precomposed
+// (NFC) on macOS, where file names are often decomposed ("e" + combining
+// accent), which a console font may not draw. Unchanged elsewhere.
+std::u16string NormalizeXmpName(const std::u16string& name);
+
+// Cuts `text` to at most `units` UTF-16 code units without splitting a
+// surrogate pair.
+std::u16string TruncateXmpText(std::u16string text, size_t units);
+
 // Opens a song file with the platform's decoder (AudioToolbox on macOS: MP3,
 // AAC/M4A, ALAC, WAV, AIFF, FLAC, CAF). nullptr and a reason on failure (no
 // decoder for the format, DRM, damaged file, or no decoder on this platform).

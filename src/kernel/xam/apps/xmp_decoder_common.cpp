@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cmath>
 #include <string_view>
 
@@ -50,12 +49,28 @@ class ToneDecoder final : public XmpSongDecoder {
 }  // namespace
 
 bool IsXmpSongFile(const std::filesystem::path& path) {
-  static constexpr std::array<std::string_view, 11> kExtensions = {
-      ".mp3", ".m4a", ".aac", ".mp4", ".alac", ".wav", ".aif", ".aiff", ".aifc", ".flac", ".caf"};
-  std::string ext = path.extension().string();
-  std::transform(ext.begin(), ext.end(), ext.begin(),
-                 [](unsigned char c) { return char(std::tolower(c)); });
+  static constexpr std::array<std::u16string_view, 11> kExtensions = {
+      u".mp3", u".m4a", u".aac", u".mp4", u".alac", u".wav", u".aif", u".aiff", u".aifc", u".flac",
+      u".caf"};
+  // UTF-16 rather than string(): that converts to the ANSI code page on Windows
+  // and throws for names outside it.
+  std::u16string ext = path.extension().u16string();
+  for (auto& c : ext) {
+    if (c >= u'A' && c <= u'Z') {
+      c = char16_t(c - u'A' + u'a');
+    }
+  }
   return std::find(kExtensions.begin(), kExtensions.end(), ext) != kExtensions.end();
+}
+
+std::u16string TruncateXmpText(std::u16string text, size_t units) {
+  if (text.size() > units) {
+    text.resize(units);
+    if (!text.empty() && text.back() >= 0xD800 && text.back() <= 0xDBFF) {
+      text.pop_back();  // half of a surrogate pair
+    }
+  }
+  return text;
 }
 
 std::unique_ptr<XmpSongDecoder> OpenXmpTestTone(double hz, uint32_t duration_ms,
