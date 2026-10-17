@@ -27,6 +27,9 @@ set(REXKERNEL_SOURCES
     xam/apps/xgi_app.cpp
     xam/apps/xlivebase_app.cpp
     xam/apps/xmp_app.cpp
+    xam/apps/xmp_decoder_common.cpp
+    xam/apps/xmp_library.cpp
+    xam/apps/xmp_streamer.cpp
 
     # XBDM subsystem - provides __imp__Xbdm* symbols
     xbdm/xbdm_module.cpp
@@ -63,7 +66,17 @@ set(REXKERNEL_SOURCES
     crt/threading.cpp
 )
 
+# Song decoding for XMP user playlists: AudioToolbox on Apple, none elsewhere.
+if(APPLE)
+    list(APPEND REXKERNEL_SOURCES xam/apps/xmp_decoder_apple.cpp)
+else()
+    list(APPEND REXKERNEL_SOURCES xam/apps/xmp_decoder_null.cpp)
+endif()
+
 list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui)
+if(APPLE)
+    target_link_libraries(rexruntime PRIVATE "-framework AudioToolbox" "-framework CoreFoundation")
+endif()

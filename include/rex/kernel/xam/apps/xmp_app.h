@@ -79,21 +79,10 @@ class XmpApp : public system::xam::App {
     std::vector<std::unique_ptr<Song>> songs;
   };
 
-  // User playlists (the console's music library) and their songs. Titles are
-  // what the title matches on: SSX looks a playlist up again by title, never by
-  // its 572-byte ID.
-  struct UserSong {
-    std::u16string title;
-    std::u16string artist;
-    std::u16string album;
-    double tone_hz = 0.0;  // test tone (--xmp_test_tone)
-    uint32_t duration_ms = 0;
-  };
-  struct UserPlaylist {
-    std::u16string title;
-    std::vector<UserSong> songs;
-  };
-  // XMP_USER_PLAYLIST_INFO, in guest layout.
+  // User playlists are the console's music library: a folder of song folders
+  // (--xmp_music_folder) and the test tone (--xmp_test_tone). Titles are what a
+  // title matches on: SSX looks a playlist up again by title, never by its
+  // 572-byte ID. XMP_USER_PLAYLIST_INFO, in guest layout:
   static constexpr size_t kUserPlaylistInfoSize = 0x334;
   using UserPlaylistRecord = std::array<uint8_t, kUserPlaylistInfoSize>;
 
@@ -133,11 +122,11 @@ class XmpApp : public system::xam::App {
   X_HRESULT XMPGetCurrentSong(uint32_t info_ptr);
   // User-playlist side of the transport messages; false if no user playlist is active.
   bool UserTransport(uint32_t message);
+  // Starts the active user playlist at a position in its play order. capture_mutex_ held.
+  void StartUserPlayback(size_t position);
+  void LogNowPlaying();
   // Audio Worker, before each title audio frame: one block of capture output.
   void PumpCapture(runtime::FunctionDispatcher* dispatcher, runtime::ThreadState* thread_state);
-  // Renders 256 stereo frames of the current song; moves to the next song at the
-  // end of one. Returns false at the end of the playlist. capture_mutex_ held.
-  bool RenderUserFrames(float* interleaved, uint32_t frames);
 
   std::atomic<State> state_;
   PlaybackClient playback_client_;
@@ -153,15 +142,17 @@ class XmpApp : public system::xam::App {
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
 
-  // User playlists: fixed after construction.
-  std::vector<UserPlaylist> user_playlists_;
+  // User playlists (fixed after construction) and the decode thread.
+  struct UserMusic;
+  std::unique_ptr<UserMusic> user_;
   // Capture output (XMPCaptureOutput) and the user playlist it plays. Guarded by
   // capture_mutex_, which the pump holds while the title's callback runs, so
   // Stop, Pause, Next and capture-off wait for a callback in progress.
   std::mutex capture_mutex_;
   int active_user_playlist_ = -1;
-  size_t active_user_song_ = 0;
-  uint64_t song_frame_ = 0;  // frames of the current song already delivered
+  std::vector<size_t> user_order_;  // play order of the active playlist (shuffled or not)
+  bool user_repeat_ = true;
+  bool log_now_playing_ = false;
   uint32_t capture_callback_ = 0;
   uint32_t capture_context_ = 0;
   bool capture_title_render_ = false;

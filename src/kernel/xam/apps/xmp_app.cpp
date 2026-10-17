@@ -13,7 +13,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <numeric>
+#include <random>
 
 #include <rex/audio/pre_frame_hook.h>
 #include <rex/cvar.h>
@@ -22,6 +25,14 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#include "xmp_decoder.h"
+#include "xmp_library.h"
+#include "xmp_streamer.h"
+
+REXCVAR_DEFINE_STRING(xmp_music_folder, "", "XMP",
+                      "Folder of user playlists for titles' custom music: each subfolder is a "
+                      "playlist of the song files below it (MP3, AAC/M4A, ALAC, WAV, AIFF, FLAC); "
+                      "~ is the home folder. Empty: none");
 REXCVAR_DEFINE_BOOL(xmp_test_tone, false, "XMP",
                     "Offer a user playlist \"Test Tone\" (440 Hz, then 660 Hz, two minutes each) "
                     "for testing the title's custom music through XMPCaptureOutput");
@@ -71,7 +82,25 @@ uint64_t Fnv1a(const std::u16string& text) {
   return hash;
 }
 
+std::filesystem::path ExpandHome(const std::string& text) {
+  if (text == "~" || text.rfind("~/", 0) == 0) {
+    const char* home = std::getenv("HOME");
+    return std::filesystem::path(home ? home : "") / text.substr(text.size() > 1 ? 2 : 1);
+  }
+  return text;
+}
+
+std::string MinutesSeconds(uint32_t ms) {
+  const uint32_t s = ms / 1000;
+  return std::to_string(s / 60) + ":" + (s % 60 < 10 ? "0" : "") + std::to_string(s % 60);
+}
+
 }  // namespace
+
+struct XmpApp::UserMusic {
+  XmpLibrary library;
+  XmpStreamer streamer;
+};
 
 XmpApp::XmpApp(KernelState* kernel_state)
     : App(kernel_state, 0xFA),
@@ -84,30 +113,52 @@ XmpApp::XmpApp(KernelState* kernel_state)
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
-      next_song_handle_(1) {
+      next_song_handle_(1),
+      user_(std::make_unique<UserMusic>()) {
+  // Scanned once: titles ask for the playlist count once per session (SSX caches it).
+  const std::string folder_setting = REXCVAR_GET(xmp_music_folder);
+  const std::filesystem::path folder = ExpandHome(folder_setting);
+  user_->library = ScanXmpLibrary(folder);
   if (REXCVAR_GET(xmp_test_tone)) {
-    UserPlaylist tone;
-    tone.title = u"Test Tone";
-    tone.songs.push_back({u"Tone 440 Hz", u"rexglue", u"Test Tone", 440.0, 120000});
-    tone.songs.push_back({u"Tone 660 Hz", u"rexglue", u"Test Tone", 660.0, 120000});
-    user_playlists_.push_back(std::move(tone));
+    std::vector<std::u16string> taken;
+    for (const auto& playlist : user_->library.playlists) {
+      taken.push_back(playlist.title);
+    }
+    XmpLibraryPlaylist tone;
+    tone.title = UniqueXmpTitle(u"Test Tone", taken);
+    tone.songs.push_back({{}, u"Tone 440 Hz", 440.0, 120000});
+    tone.songs.push_back({{}, u"Tone 660 Hz", 660.0, 120000});
+    user_->library.songs += tone.songs.size();
+    user_->library.playlists.push_back(std::move(tone));
   }
-  size_t songs = 0;
-  for (const auto& playlist : user_playlists_) {
-    songs += playlist.songs.size();
+  if (!folder_setting.empty() || REXCVAR_GET(xmp_test_tone)) {
+    REXKRNL_INFO("XMP: {} user playlists, {} songs{} (music folder {}{})",
+                 user_->library.playlists.size(), user_->library.songs,
+                 user_->library.skipped
+                     ? ", " + std::to_string(user_->library.skipped) + " files not songs"
+                     : std::string(),
+                 folder.string(),
+                 folder_setting.empty() || std::filesystem::is_directory(folder) ? ""
+                                                                                 : ", missing");
+    for (const auto& playlist : user_->library.playlists) {
+      REXKRNL_INFO("XMP:   \"{}\": {} songs", rex::string::to_utf8(playlist.title),
+                   playlist.songs.size());
+    }
   }
-  REXKRNL_INFO("XMP: {} user playlists, {} songs", user_playlists_.size(), songs);
   rex::audio::SetPreFrameHook(
       [this](runtime::FunctionDispatcher* dispatcher, runtime::ThreadState* thread_state) {
         PumpCapture(dispatcher, thread_state);
       });
 }
 
-XmpApp::~XmpApp() { rex::audio::SetPreFrameHook({}); }
+XmpApp::~XmpApp() {
+  rex::audio::SetPreFrameHook({});  // before the streamer and its thread go
+  user_.reset();
+}
 
 std::vector<XmpApp::UserPlaylistRecord> XmpApp::UserPlaylistRecords() const {
   std::vector<UserPlaylistRecord> records;
-  for (const auto& playlist : user_playlists_) {
+  for (const auto& playlist : user_->library.playlists) {
     UserPlaylistRecord record{};
     // 572-byte ID, opaque to the title: a tag and a hash of the title, so it
     // stays the same between runs.
@@ -312,9 +363,10 @@ X_HRESULT XmpApp::XMPPlayUserPlaylist(uint32_t buffer_ptr, uint32_t buffer_lengt
   // itself does.
   const uint8_t* record = memory_->TranslateVirtual(buffer_ptr) + 4;
   const std::u16string title = LoadString(record + 0x23C);
+  const auto& playlists = user_->library.playlists;
   int index = -1;
-  for (size_t i = 0; i < user_playlists_.size(); ++i) {
-    if (user_playlists_[i].title == title) {
+  for (size_t i = 0; i < playlists.size(); ++i) {
+    if (playlists[i].title == title) {
       index = int(i);
       break;
     }
@@ -323,6 +375,8 @@ X_HRESULT XmpApp::XMPPlayUserPlaylist(uint32_t buffer_ptr, uint32_t buffer_lengt
     REXKRNL_WARN("XMP: play user playlist \"{}\": no such playlist", rex::string::to_utf8(title));
     return X_E_NOTFOUND;
   }
+  const uint32_t mode = static_cast<uint32_t>(playback_mode_);
+  const uint32_t repeat = static_cast<uint32_t>(repeat_mode_);
   bool restarted = true;
   {
     std::lock_guard<std::mutex> lock(capture_mutex_);
@@ -330,20 +384,66 @@ X_HRESULT XmpApp::XMPPlayUserPlaylist(uint32_t buffer_ptr, uint32_t buffer_lengt
       restarted = false;  // a repeated play doesn't restart the song
     } else {
       active_user_playlist_ = index;
-      active_user_song_ = 0;
-      song_frame_ = 0;
+      // XDK playback behaviour: mode 1 shuffles; repeat mode 1 plays the
+      // playlist once, 0 repeats it.
+      user_order_.resize(playlists[index].songs.size());
+      std::iota(user_order_.begin(), user_order_.end(), size_t(0));
+      if (mode == 1) {
+        std::shuffle(user_order_.begin(), user_order_.end(), std::mt19937(std::random_device{}()));
+      }
+      user_repeat_ = repeat != 1;
+      StartUserPlayback(0);
     }
     active_playlist_ = nullptr;
     // Playing before this returns: the title stops the session if its first
     // status check after the start reads idle.
     state_ = State::kPlaying;
   }
-  const auto& playlist = user_playlists_[index];
-  REXKRNL_INFO("XMP: {} user playlist \"{}\" ({} songs, {} bytes)",
-               restarted ? "playing" : "already playing", rex::string::to_utf8(playlist.title),
-               playlist.songs.size(), buffer_length);
+  REXKRNL_INFO("XMP: {} user playlist \"{}\" ({} songs, {}, {}; {} bytes)",
+               restarted ? "playing" : "already playing", rex::string::to_utf8(title),
+               playlists[index].songs.size(), mode == 1 ? "shuffle" : "in order",
+               repeat != 1 ? "repeat" : "once", buffer_length);
   OnStateChanged();
   return X_E_SUCCESS;
+}
+
+void XmpApp::StartUserPlayback(size_t position) {
+  const auto& songs = user_->library.playlists[active_user_playlist_].songs;
+  user_->streamer.Start(
+      [&songs](size_t song) -> std::unique_ptr<XmpSongDecoder> {
+        if (song >= songs.size()) {
+          return nullptr;
+        }
+        const XmpLibrarySong& entry = songs[song];
+        if (entry.path.empty()) {
+          return OpenXmpTestTone(entry.tone_hz, entry.tone_ms, entry.title);
+        }
+        std::string error;
+        auto decoder = OpenXmpSongFile(entry.path, &error);
+        if (!decoder) {
+          REXKRNL_WARN("XMP: skipping {}: {}", entry.path.string(), error);
+        }
+        return decoder;
+      },
+      user_order_, position, user_repeat_);
+  log_now_playing_ = true;
+}
+
+void XmpApp::LogNowPlaying() {
+  size_t position = 0;
+  size_t song = 0;
+  XmpSongInfo info;
+  if (active_user_playlist_ < 0 || !user_->streamer.Current(&position, &song, &info)) {
+    return;
+  }
+  const auto& playlist = user_->library.playlists[active_user_playlist_];
+  const std::u16string& title = info.title.empty() ? playlist.songs[song].title : info.title;
+  REXKRNL_INFO("XMP: now playing \"{}\" {}/{}: \"{}\"{} ({}, {:.1f} kHz, {})",
+               rex::string::to_utf8(playlist.title), position + 1, user_order_.size(),
+               rex::string::to_utf8(title),
+               info.artist.empty() ? std::string() : " by " + rex::string::to_utf8(info.artist),
+               info.format.empty() ? "?" : info.format, info.source_rate / 1000.0,
+               MinutesSeconds(info.duration_ms));
 }
 
 X_HRESULT XmpApp::XMPCaptureOutput(uint32_t buffer_ptr) {
@@ -378,26 +478,29 @@ X_HRESULT XmpApp::XMPGetCurrentSong(uint32_t info_ptr) {
   // artist, album, album artist and genre at 80-byte (40-character) spacing,
   // track number, duration (ms), format.
   uint8_t* info = memory_->TranslateVirtual(info_ptr);
-  UserSong user_song;
-  uint32_t handle = 0;
+  XmpSongInfo song_info;
+  std::u16string fallback_title;
+  size_t position = 0;
+  size_t song_index = 0;
+  bool user_song = false;
   {
     std::lock_guard<std::mutex> lock(capture_mutex_);
-    if (active_user_playlist_ >= 0) {
-      const auto& songs = user_playlists_[active_user_playlist_].songs;
-      if (active_user_song_ < songs.size()) {
-        user_song = songs[active_user_song_];
-        handle = uint32_t(active_user_song_ + 1);
-      }
+    if (active_user_playlist_ >= 0 && user_->streamer.Current(&position, &song_index, &song_info)) {
+      fallback_title = user_->library.playlists[active_user_playlist_].songs[song_index].title;
+      user_song = true;
     }
   }
-  if (handle) {
+  if (user_song) {
     std::memset(info, 0, 0x3E0);
-    memory::store_and_swap<uint32_t>(info + 0x000, handle);
-    StoreString(info + 0x240, user_song.title);
-    StoreString(info + 0x290, user_song.artist);
-    StoreString(info + 0x2E0, user_song.album);
-    memory::store_and_swap<uint32_t>(info + 0x3D0, handle);
-    memory::store_and_swap<uint32_t>(info + 0x3D4, user_song.duration_ms);
+    memory::store_and_swap<uint32_t>(info + 0x000, uint32_t(song_index + 1));
+    StoreString(info + 0x240, song_info.title.empty() ? fallback_title : song_info.title);
+    StoreString(info + 0x290, song_info.artist);
+    StoreString(info + 0x2E0, song_info.album);
+    StoreString(info + 0x380, song_info.genre);
+    memory::store_and_swap<uint32_t>(info + 0x3D0,
+                                     song_info.track_number ? song_info.track_number
+                                                            : uint32_t(position + 1));
+    memory::store_and_swap<uint32_t>(info + 0x3D4, song_info.duration_ms);
     memory::store_and_swap<uint32_t>(info + 0x3D8, uint32_t(Song::Format::kMp3));
     return X_E_SUCCESS;
   }
@@ -424,7 +527,9 @@ bool XmpApp::UserTransport(uint32_t message) {
     if (active_user_playlist_ < 0) {
       return false;
     }
-    const size_t count = user_playlists_[active_user_playlist_].songs.size();
+    const size_t count = user_order_.size();
+    size_t position = 0;
+    user_->streamer.Current(&position, nullptr, nullptr);
     switch (message) {
       case 0x00070003:  // Continue (the title's flow control sends Pause/Continue)
         if (state_ == State::kPaused) {
@@ -433,6 +538,7 @@ bool XmpApp::UserTransport(uint32_t message) {
         break;
       case 0x00070004:  // Stop
         REXKRNL_INFO("XMP: user playlist stopped");
+        user_->streamer.Stop();
         active_user_playlist_ = -1;
         state_ = State::kIdle;
         break;
@@ -442,62 +548,25 @@ bool XmpApp::UserTransport(uint32_t message) {
         }
         break;
       case 0x00070006:  // Next
-        active_user_song_ = count ? (active_user_song_ + 1) % count : 0;
-        song_frame_ = 0;
+        StartUserPlayback(count ? (position + 1) % count : 0);
         state_ = State::kPlaying;
         break;
       case 0x00070007:  // Previous
-        active_user_song_ = count ? (active_user_song_ + count - 1) % count : 0;
-        song_frame_ = 0;
+        StartUserPlayback(count ? (position + count - 1) % count : 0);
         state_ = State::kPlaying;
         break;
       default:
         return false;
     }
-    REXKRNL_DEBUG("XMP: user transport {:08X} -> state {}, song {}", message,
-                  static_cast<uint32_t>(state_.load()), active_user_song_);
+    REXKRNL_DEBUG("XMP: user transport {:08X} -> state {}", message,
+                  static_cast<uint32_t>(state_.load()));
   }
   OnStateChanged();
   return true;
 }
-
-bool XmpApp::RenderUserFrames(float* interleaved, uint32_t frames) {
-  const auto& songs = user_playlists_[active_user_playlist_].songs;
-  uint32_t i = 0;
-  while (i < frames) {
-    if (active_user_song_ >= songs.size()) {
-      break;
-    }
-    const UserSong& song = songs[active_user_song_];
-    const uint64_t total = uint64_t(song.duration_ms) * kSampleRate / 1000;
-    if (song_frame_ >= total) {
-      // A song ends with its last samples; the next one starts with the next
-      // block (the rest of this one stays silent).
-      ++active_user_song_;
-      song_frame_ = 0;
-      if (active_user_song_ >= songs.size()) {
-        active_user_song_ = 0;  // repeat the playlist
-      }
-      break;
-    }
-    const double phase = 2.0 * 3.14159265358979323846 * song.tone_hz * double(song_frame_) /
-                         double(kSampleRate);
-    const float v = float(0.25 * std::sin(phase));
-    interleaved[i * 2] = v;
-    interleaved[i * 2 + 1] = v;
-    ++song_frame_;
-    ++i;
-  }
-  for (; i < frames; ++i) {
-    interleaved[i * 2] = 0.0f;
-    interleaved[i * 2 + 1] = 0.0f;
-  }
-  return true;
-}
-
 void XmpApp::PumpCapture(runtime::FunctionDispatcher* dispatcher,
                          runtime::ThreadState* thread_state) {
-  bool song_changed = false;
+  bool notify = false;
   {
     std::lock_guard<std::mutex> lock(capture_mutex_);
     // The title paces the feed itself: it sends Pause when its ring is full
@@ -507,9 +576,7 @@ void XmpApp::PumpCapture(runtime::FunctionDispatcher* dispatcher,
       return;
     }
     float block[kCaptureFrames * 2];
-    const size_t song_before = active_user_song_;
-    RenderUserFrames(block, kCaptureFrames);
-    song_changed = active_user_song_ != song_before;
+    const XmpStreamer::ReadResult read = user_->streamer.Read(block, kCaptureFrames);
     // 48 kHz stereo float, big-endian in guest memory.
     uint8_t* dst = memory_->TranslateVirtual(capture_buffer_);
     for (uint32_t i = 0; i < kCaptureFrames * 2; ++i) {
@@ -518,15 +585,27 @@ void XmpApp::PumpCapture(runtime::FunctionDispatcher* dispatcher,
     uint64_t args[] = {capture_buffer_, capture_context_, 1};
     dispatcher->Execute(thread_state, capture_callback_, args, 3);
     ++capture_blocks_;
-    if (capture_blocks_ == 1 || capture_blocks_ % 11250 == 0) {  // first, then once a minute
-      REXKRNL_INFO("XMP: capture output: {} blocks delivered", capture_blocks_);
+    if (capture_blocks_ % 11250 == 0) {  // once a minute
+      REXKRNL_INFO("XMP: capture output: {} blocks delivered, {} short", capture_blocks_,
+                   user_->streamer.underrun_blocks());
+    }
+    if (read.ended) {
+      REXKRNL_INFO("XMP: user playlist finished");
+      active_user_playlist_ = -1;
+      state_ = State::kIdle;
+      notify = true;
+    } else if (read.song_changed || log_now_playing_) {
+      // The first block of a song: the title reads the new song's info on the
+      // notification.
+      log_now_playing_ = false;
+      LogNowPlaying();
+      notify = read.song_changed;
     }
   }
-  if (song_changed) {
-    OnStateChanged();  // the title reads the new song's info on this
+  if (notify) {
+    OnStateChanged();
   }
 }
-
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
