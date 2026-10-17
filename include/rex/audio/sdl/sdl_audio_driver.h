@@ -18,6 +18,8 @@
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
 
+#include <cstdio>
+
 #include <SDL3/SDL.h>
 
 namespace rex::audio::sdl {
@@ -34,6 +36,30 @@ class SDLAudioDriver : public AudioDriver {
  protected:
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
+  // Applies the output envelope to one converted frame (frame == true) or fills an
+  // underrun slot (frame == false). Returns the frame's peak after the envelope.
+  float ApplyEnvelope(float* data, bool frame, int channels, float target);
+  void CountUnderrun(bool underrun);
+
+  // Output envelope (audio_declick): fades in at start, ramps volume, mute and the
+  // quit fade over 20 ms, and eases an underrun to silence instead of cutting.
+  // Touched only on the SDL device thread.
+  float env_ = 0.0f;
+  float hold_[6] = {};
+  float last_out_[6] = {};
+  bool underrun_ = false;
+  uint32_t silent_callbacks_ = 0;
+  bool fade_signalled_ = false;
+  bool output_open_ = false;  // registered with OutputOpened
+  // Underrun statistics, in guest frames (5.33 ms each).
+  uint32_t underrun_run_ = 0;
+  uint64_t underrun_episodes_ = 0;
+  uint64_t underrun_frames_ = 0;
+  uint32_t underrun_longest_ = 0;
+  uint64_t reported_episodes_ = 0;
+  int64_t last_report_ms_ = 0;
+  FILE* capture_ = nullptr;
+  bool capture_opened_ = false;
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 

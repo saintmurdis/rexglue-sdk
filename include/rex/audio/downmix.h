@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <chrono>
+
 namespace rex::audio {
 
 /**
@@ -61,5 +63,18 @@ SurroundMix GetSurroundMix();
 /// 1.0 is unity. Above unity can clip, and the output stage clamps.
 void SetOutputGain(float linear);
 float GetOutputGain();
+
+/// Quit fade. BeginOutputFadeOut ramps every output to silence and keeps it
+/// silent until the process exits; any thread. Each output registers with
+/// OutputOpened/OutputClosed and calls SignalOutputFadedOut once that silence has
+/// replaced every buffer its device had queued. WaitOutputFadedOut returns true
+/// when every open output has signalled (at once if none is open), false on
+/// timeout.
+void BeginOutputFadeOut();
+bool OutputFadeOutRequested();
+void SignalOutputFadedOut();
+bool WaitOutputFadedOut(std::chrono::milliseconds timeout);
+void OutputOpened();
+void OutputClosed(bool signalled_fade_out);
 
 }  // namespace rex::audio

@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -25,6 +27,12 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_BOOL(audio_declick, true, "Audio",
+                    "Smooth the output: fade in at start, 20 ms ramps for volume, mute and the "
+                    "quit fade, and ease underruns to silence instead of cutting (clicks)");
+REXCVAR_DEFINE_STRING(audio_capture_file, "", "Audio",
+                      "Debug: write the exact float samples sent to the audio device "
+                      "(interleaved, device channel count, 48 kHz) to this raw file");
 
 namespace rex::audio::sdl {
 
@@ -106,6 +114,8 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
+  OutputOpened();
+  output_open_ = true;
   return true;
 }
 
@@ -140,8 +150,16 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
 void SDLAudioDriver::Shutdown() {
   if (sdl_stream_) {
-    SDL_DestroyAudioStream(sdl_stream_);
+    SDL_DestroyAudioStream(sdl_stream_);  // stops the callback
     sdl_stream_ = nullptr;
+  }
+  if (output_open_) {
+    OutputClosed(fade_signalled_);
+    output_open_ = false;
+  }
+  if (capture_) {
+    std::fclose(capture_);
+    capture_ = nullptr;
   }
   if (sdl_initialized_) {
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -178,53 +196,151 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
+  const bool declick = REXCVAR_GET(audio_declick);
+  const bool muted = REXCVAR_GET(audio_mute);
+  const bool fading = OutputFadeOutRequested();
+  const float target = (muted || fading) ? 0.0f : gain;
+  if (!driver->capture_opened_) {
+    driver->capture_opened_ = true;
+    const std::string& path = REXCVAR_GET(audio_capture_file);
+    if (!path.empty()) {
+      driver->capture_ = std::fopen(path.c_str(), "wb");
+      REXAPU_INFO("audio capture to {}: {}", path, driver->capture_ ? "on" : "can't open the file");
+    }
+  }
+  float peak = 0.0f;
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
-    if (driver->frames_queued_.empty()) {
-      if (sdl_callback_count < 10) {
-        REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
-        sdl_callback_count++;
-      }
-      std::memset(data, 0, len);
-      if (!SDL_PutAudioStreamData(stream, data, len)) {
-        REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
-        break;
-      }
-      additional_amount -= len;
-    } else {
-      auto buffer = driver->frames_queued_.front();
+    float* buffer = nullptr;
+    if (!driver->frames_queued_.empty()) {
+      buffer = driver->frames_queued_.front();
       driver->frames_queued_.pop();
-      if (REXCVAR_GET(audio_mute)) {
-        std::memset(data, 0, len);
-      } else {
-        switch (driver->sdl_device_channels_) {
-          case 2:
-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-                                                            gain);
-            break;
-          case 6:
-            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
-                                                            gain);
-            break;
-          default:
-            assert_unhandled_case(driver->sdl_device_channels_);
-            break;
-        }
+    } else if (sdl_callback_count < 10) {
+      REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+      sdl_callback_count++;
+    }
+    const int channels = driver->sdl_device_channels_;
+    if (buffer && !(muted && !declick)) {
+      // With the envelope the gain is applied per sample below, so volume changes ramp.
+      const float frame_gain = declick ? 1.0f : gain;
+      switch (channels) {
+        case 2:
+          conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+                                                          frame_gain);
+          break;
+        case 6:
+          conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
+                                                          frame_gain);
+          break;
+        default:
+          assert_unhandled_case(driver->sdl_device_channels_);
+          break;
       }
-      if (!SDL_PutAudioStreamData(stream, data, len)) {
-        REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+    }
+    if (declick) {
+      peak = std::max(peak, driver->ApplyEnvelope(data, buffer != nullptr, channels, target));
+    } else if (!buffer || muted) {
+      std::memset(data, 0, len);
+    }
+    if (!fading) {
+      driver->CountUnderrun(buffer == nullptr);
+    }
+    if (driver->capture_) {
+      std::fwrite(data, 1, len, driver->capture_);
+    }
+    if (!SDL_PutAudioStreamData(stream, data, len)) {
+      REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+      if (buffer) {
         driver->frames_unused_.push(buffer);
-        break;
       }
+      break;
+    }
+    if (buffer) {
       driver->frames_unused_.push(buffer);
-
       auto ret = driver->semaphore_->Release(1, nullptr);
       assert_true(ret);
-      additional_amount -= len;
     }
+    additional_amount -= len;
+  }
+  if (driver->capture_) {
+    std::fflush(driver->capture_);  // the process hard-exits on quit
+  }
+  // Quit fade: once the envelope is at zero, count device buffers of silence. CoreAudio
+  // keeps 3 queued, so after 4 silent refills everything audible has played out. Without
+  // the envelope, report at once (the old hard cut).
+  if (fading && (!declick || (driver->env_ == 0.0f && peak < 1e-5f))) {
+    if (++driver->silent_callbacks_ >= (declick ? 4u : 1u) && !driver->fade_signalled_) {
+      driver->fade_signalled_ = true;
+      SignalOutputFadedOut();
+      REXAPU_INFO("audio faded out; underruns this session: {}, longest {:.0f} ms, {:.0f} ms total",
+                  driver->underrun_episodes_, driver->underrun_longest_ * 5.333,
+                  driver->underrun_frames_ * 5.333);
+    }
+  } else {
+    driver->silent_callbacks_ = 0;
   }
   SDL_stack_free(data);
+}
+
+float SDLAudioDriver::ApplyEnvelope(float* data, bool frame, int channels, float target) {
+  constexpr float kStep = 1.0f / 960.0f;  // 0 -> 1 in 20 ms at 48 kHz
+  constexpr float kHoldDecay = 0.995f;    // ~4.2 ms time constant: -100 dB after ~48 ms
+  channels = std::clamp(channels, 1, 6);
+  if (!frame) {
+    if (!underrun_) {
+      // Start of an underrun: decay from where the signal was instead of cutting to 0.
+      std::copy(last_out_, last_out_ + channels, hold_);
+      underrun_ = true;
+    }
+    env_ = 0.0f;  // the next real frame fades in
+  } else {
+    underrun_ = false;
+  }
+  float peak = 0.0f;
+  for (uint32_t s = 0; s < channel_samples_; ++s) {
+    if (frame) {
+      env_ += std::clamp(target - env_, -kStep, kStep);
+    }
+    for (int c = 0; c < channels; ++c) {
+      hold_[c] *= kHoldDecay;
+      if (std::fabs(hold_[c]) < 1e-6f) {
+        hold_[c] = 0.0f;  // exact silence, no denormals
+      }
+      float v = hold_[c];
+      if (frame) {
+        v += data[s * channels + c] * env_;
+      }
+      v = std::clamp(v, -1.0f, 1.0f);
+      data[s * channels + c] = v;
+      last_out_[c] = v;
+      peak = std::max(peak, std::fabs(v));
+    }
+  }
+  return peak;
+}
+
+void SDLAudioDriver::CountUnderrun(bool underrun) {
+  if (underrun) {
+    ++underrun_run_;
+    return;
+  }
+  if (underrun_run_) {
+    ++underrun_episodes_;
+    underrun_frames_ += underrun_run_;
+    underrun_longest_ = std::max(underrun_longest_, underrun_run_);
+    underrun_run_ = 0;
+    // At most one line a minute, and only when something happened.
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    if (underrun_episodes_ != reported_episodes_ && now_ms - last_report_ms_ >= 60000) {
+      REXAPU_INFO("audio underruns: {} so far, longest {:.0f} ms", underrun_episodes_,
+                  underrun_longest_ * 5.333);
+      reported_episodes_ = underrun_episodes_;
+      last_report_ms_ = now_ms;
+    }
+  }
 }
 
 }  // namespace rex::audio::sdl
