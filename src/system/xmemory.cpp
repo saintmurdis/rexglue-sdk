@@ -869,12 +869,36 @@ void Memory::ResetFunctionTables() {
   for (const auto& entry : function_tables_) {
     uint32_t table_size = (entry.code_size + entry.thunk_reserve) * 2;
     auto* heap = LookupHeap(entry.table_base);
-    // Commit-only: pages still reserved by the image keep their reservation, free
-    // pages are reserved again. On the host this only restores access.
-    if (!heap || !heap->AllocFixed(entry.table_base, table_size, heap->page_size(),
-                                   memory::kMemoryAllocationCommit,
-                                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
-      REXSYS_WARN("ResetFunctionTables: couldn't re-commit the table at {:08X}", entry.table_base);
+    if (!heap) {
+      continue;
+    }
+    // Pages still reserved by the image (a shrunk title-update image) only need a
+    // commit; pages the load freed are reserved again. Done per run of pages in
+    // the same state; on the host this only restores access.
+    const uint32_t page = heap->page_size();
+    const uint32_t end = entry.table_base + rex::round_up(table_size, page);
+    uint32_t run_start = entry.table_base;
+    bool run_reserved = false;
+    for (uint32_t address = entry.table_base; address <= end; address += page) {
+      bool reserved = false;
+      if (address < end) {
+        HeapAllocationInfo info;
+        reserved = heap->QueryRegionInfo(address, &info) &&
+                   (info.state & memory::kMemoryAllocationReserve);
+      }
+      if (address == entry.table_base) {
+        run_reserved = reserved;
+      } else if (address == end || reserved != run_reserved) {
+        uint32_t type = run_reserved
+                            ? memory::kMemoryAllocationCommit
+                            : memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit;
+        if (!heap->AllocFixed(run_start, address - run_start, page, type,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+          REXSYS_WARN("ResetFunctionTables: couldn't re-commit {:08X}-{:08X}", run_start, address);
+        }
+        run_start = address;
+        run_reserved = reserved;
+      }
     }
     Zero(entry.table_base, table_size);
   }
